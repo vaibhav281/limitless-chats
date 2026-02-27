@@ -1,0 +1,61 @@
+# ==============================
+# Dependencies
+# ==============================
+node_modules/
+
+# ==============================
+# Environment Variables
+# ==============================
+.env
+.env.*
+!.env.example
+
+# ==============================
+# Build Outputs
+# ==============================
+dist/
+build/
+.out/
+
+# ==============================
+# Logs
+# ==============================
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ==============================
+# Coverage
+# ==============================
+coverage/
+.nyc_output/
+
+# ==============================
+# Runtime Files
+# ==============================
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# ==============================
+# OS / Editor Files
+# ==============================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ==============================
+# App Specific
+# ==============================
+uploads/
+temp/
+
+# Debug / Dumps
+*.txt
+server/*.txt
+server/*dump*
+server/keys_dump.json
