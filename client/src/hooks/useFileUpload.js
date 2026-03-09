@@ -41,7 +41,7 @@ export default function useFileUpload() {
         }
     }, []);
 
-    const downloadFile = useCallback(async (url, originalName) => {
+    const downloadFile = useCallback(async (url, originalName, encryptionKeys = null) => {
         if (url && url.startsWith('blob:')) {
             const a = document.createElement('a');
             a.href = url;
@@ -50,7 +50,7 @@ export default function useFileUpload() {
             return;
         }
 
-        tasksRef.current[url] = { type: 'download', url, originalName };
+        tasksRef.current[url] = { type: 'download', url, originalName, encryptionKeys };
         const cancelSource = axios.CancelToken.source();
 
         setFileProgress((prev) => ({
@@ -59,12 +59,32 @@ export default function useFileUpload() {
         }));
 
         try {
-            await downloadFileWithProgress(url, originalName, (progress) => {
-                setFileProgress((prev) => ({
-                    ...prev,
-                    [url]: { ...prev[url], progress }
-                }));
-            }, cancelSource);
+            if (encryptionKeys && encryptionKeys.aesKey && encryptionKeys.iv) {
+                // Secure E2EE Download Path
+                const { downloadAndDecryptFileWithProgress } = await import("../services/fileService");
+                await downloadAndDecryptFileWithProgress(
+                    url,
+                    originalName,
+                    encryptionKeys.aesKey,
+                    encryptionKeys.iv,
+                    encryptionKeys.mimeType,
+                    (progress) => {
+                        setFileProgress((prev) => ({
+                            ...prev,
+                            [url]: { ...prev[url], progress }
+                        }));
+                    },
+                    cancelSource
+                );
+            } else {
+                // Legacy / Plaintext Download Path
+                await downloadFileWithProgress(url, originalName, (progress) => {
+                    setFileProgress((prev) => ({
+                        ...prev,
+                        [url]: { ...prev[url], progress }
+                    }));
+                }, cancelSource);
+            }
 
             setFileProgress((prev) => {
                 const next = { ...prev };

@@ -1,6 +1,7 @@
 import { SessionCipher, SignalProtocolAddress } from '@privacyresearch/libsignal-protocol-typescript';
 import { signalStore } from './keyManager';
 import { ensureSession } from './sessionManager';
+import { Buffer } from 'buffer';
 
 // Encrypts plaintext message into a Signal Ciphertext object
 export const encryptMessage = async (remoteUserId, plaintext) => {
@@ -19,9 +20,17 @@ export const encryptMessage = async (remoteUserId, plaintext) => {
         // 4. Encrypt! This produces either a PreKeyWhisperMessage (type 3) or WhisperMessage (type 1)
         const ciphertextObj = await cipher.encrypt(plaintextBuffer.buffer);
 
+        // Natively convert Libsignal binary strings/buffers to pure secure Base64 for JSON transit!
+        let base64Body;
+        if (typeof ciphertextObj.body === 'string') {
+            base64Body = Buffer.from(ciphertextObj.body, 'binary').toString('base64');
+        } else {
+            base64Body = Buffer.from(ciphertextObj.body).toString('base64');
+        }
+
         return {
             type: ciphertextObj.type,
-            body: ciphertextObj.body // This is typically a base64 string provided by libsignal
+            body: base64Body
         };
 
     } catch (err) {

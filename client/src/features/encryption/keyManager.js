@@ -2,6 +2,7 @@ import { KeyHelper } from '@privacyresearch/libsignal-protocol-typescript';
 import { SignalProtocolStore } from './SignalProtocolStore';
 import { bufferToBase64, base64ToBuffer } from './cryptoService';
 import { clearLocalMessages } from './localMessageStore';
+import { mediaKeyCache } from './mediaKeyCache';
 import axios from 'axios';
 
 // Singleton Store
@@ -80,6 +81,7 @@ export const generateAndUploadKeys = async (userId) => {
 export const clearLocalKeys = async () => {
     try {
         await clearLocalMessages();
+        await mediaKeyCache.clearCache();
     } catch (err) {
         console.warn(err);
     }

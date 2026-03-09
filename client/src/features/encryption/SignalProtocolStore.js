@@ -8,13 +8,15 @@ export class SignalProtocolStore {
     }
 
     async initDB() {
-        if (this.db) return Promise.resolve();
+        if (this.db) return;
         if (this._initPromise) return this._initPromise;
 
+        console.log("[SignalStore] Initializing IndexedDB...");
         this._initPromise = new Promise((resolve, reject) => {
             const request = indexedDB.open(this.dbName, this.dbVersion);
             request.onupgradeneeded = (e) => {
                 const db = e.target.result;
+                console.log("[SignalStore] Upgrading IndexedDB stores...");
                 this.storeNames.forEach(name => {
                     if (!db.objectStoreNames.contains(name)) {
                         db.createObjectStore(name);
@@ -24,11 +26,13 @@ export class SignalProtocolStore {
             request.onsuccess = () => {
                 this.db = request.result;
                 this._initPromise = null;
+                console.log("[SignalStore] IndexedDB Initialized.");
                 resolve();
             };
-            request.onerror = () => {
+            request.onerror = (e) => {
+                console.error("[SignalStore] IndexedDB Init Error:", e.target.error);
                 this._initPromise = null;
-                reject(request.error);
+                reject(e.target.error);
             };
         });
 
@@ -101,13 +105,24 @@ export class SignalProtocolStore {
     }
 
     async isTrustedIdentity(identifier, identityKey, direction) {
+        if (!identifier) throw new Error("tried to check identity for undefined");
+
         const trusted = await this._get('identityKeys', identifier);
-        if (!trusted) return true; // Trust on first use
-        // Using a simple array buffer compare
+
+        if (!trusted) {
+            console.log(`[SignalStore] Trusting identity on first use for ${identifier}`);
+            return true;
+        }
+
         const t8 = new Uint8Array(trusted);
         const i8 = new Uint8Array(identityKey);
+
         if (t8.length !== i8.length) return false;
-        for (let i = 0; i < t8.length; i++) if (t8[i] !== i8[i]) return false;
+
+        for (let i = 0; i < t8.length; i++) {
+            if (t8[i] !== i8[i]) return false;
+        }
+
         return true;
     }
 
@@ -128,7 +143,10 @@ export class SignalProtocolStore {
     }
 
     async storePreKey(keyId, keyPair) {
-        return this._put('preKeys', keyId, keyPair);
+        return this._put('preKeys', keyId, {
+            keyId: keyId,
+            keyPair: keyPair
+        });
     }
 
     async removePreKey(keyId) {
@@ -144,7 +162,10 @@ export class SignalProtocolStore {
     }
 
     async storeSignedPreKey(keyId, keyPair) {
-        return this._put('signedPreKeys', keyId, keyPair);
+        return this._put('signedPreKeys', keyId, {
+            keyId: keyId,
+            keyPair: keyPair
+        });
     }
 
     async removeSignedPreKey(keyId) {
@@ -152,11 +173,20 @@ export class SignalProtocolStore {
     }
 
     async loadSession(identifier) {
-        return this._get('sessions', identifier);
+        const session = await this._get('sessions', identifier);
+        if (session) {
+            console.log(`[SignalStore] Loaded session for ${identifier}`);
+        } else {
+            console.warn(`[SignalStore] No session found for ${identifier}`);
+        }
+        return session;
     }
 
     async storeSession(identifier, record) {
-        return this._put('sessions', identifier, record);
+        console.log(`[SignalStore] Storing session for ${identifier}`);
+        // Ensure serialization if the record provides it (Signal Protocol v2+ handling)
+        const serializedRecord = typeof record.serialize === 'function' ? record.serialize() : record;
+        return this._put('sessions', identifier, serializedRecord);
     }
 
     async removeSession(identifier) {

@@ -17,6 +17,7 @@ import dayjs from "dayjs";
 import { getUserColor } from '../../../utils/getUserColor';
 import { parseMessageText } from '../../../utils/messageParser';
 import DecryptedMedia from './DecryptedMedia';
+import { blobCache } from '../../encryption/blobCache';
 
 const MessageBubble = React.forwardRef(({ 
   note, 
@@ -74,7 +75,24 @@ const MessageBubble = React.forwardRef(({
 
   const handleMediaClick = (e, idx) => {
     e.stopPropagation();
-    onPreviewMedia({ items: note.attachments, currentIndex: idx, note });
+    // Swap the raw encrypted URLs with decrypted cached blob URLs if they exist
+    const itemsWithDecryptedUrls = note.attachments.map(att => {
+        // Optimistic local sender blobs are natively decrypted
+        if (att.url && att.url.startsWith('blob:')) {
+            return { ...att, _isReady: true };
+        }
+        
+        const cacheKey = `${note._id}_${att.attachmentId || (att.fileIndex !== undefined ? att.fileIndex : (att.index || att.originalName))}`;
+        const cachedUrl = blobCache.get(cacheKey);
+        return { ...att, url: cachedUrl || att.url, _isReady: !!cachedUrl }; 
+    });
+
+    // To prevent WhatsApp-style corruption previews, strictly prevent viewing until decrypted
+    if (!itemsWithDecryptedUrls[idx]._isReady) {
+        return; // Decryption still in progress or failed
+    }
+
+    onPreviewMedia({ items: itemsWithDecryptedUrls, currentIndex: idx, note });
   };
 
   // -----------------------------------------
@@ -264,6 +282,7 @@ const MessageBubble = React.forwardRef(({
                       >
                          <DecryptedMedia 
                            attachment={att} 
+                           noteId={note._id}
                            remoteUserId={remoteUserId}
                            isSentByMe={isSentByMe}
                            isSingle={isSingle}
@@ -318,7 +337,7 @@ const MessageBubble = React.forwardRef(({
                                               <ErrorOutlineIcon sx={{ color: '#ff4c4c', fontSize: 24 }} />
                                               <Typography variant="caption" sx={{ color: '#fff' }}>Download Failed</Typography>
                                               <Box sx={{ display: 'flex', gap: 0.5 }}>
-                                                <Button size="small" variant="contained" sx={{ textTransform: 'none', bgcolor: '#00a884', color: '#fff', fontSize: '0.7rem', padding: '2px 8px', minWidth: 0, '&:hover': { bgcolor: '#008a6d' } }} onClick={(e) => { e.stopPropagation(); retryTask(att.url) || downloadFile(att.decryptedUrl || att.url, att.originalName); }}>
+                                                <Button size="small" variant="contained" sx={{ textTransform: 'none', bgcolor: '#00a884', color: '#fff', fontSize: '0.7rem', padding: '2px 8px', minWidth: 0, '&:hover': { bgcolor: '#008a6d' } }} onClick={(e) => { e.stopPropagation(); retryTask(att.url) || downloadFile(att.url, att.originalName, att.binaryAesKey ? { aesKey: att.binaryAesKey, iv: att.binaryIv, mimeType: att.originalMimeType } : null); }}>
                                                    Retry
                                                 </Button>
                                                 <Button size="small" variant="outlined" sx={{ textTransform: 'none', color: '#fff', borderColor: '#fff', fontSize: '0.7rem', padding: '2px 8px', minWidth: 0 }} onClick={(e) => { e.stopPropagation(); window.open(att.url, '_blank'); }}>
@@ -330,7 +349,7 @@ const MessageBubble = React.forwardRef(({
                                     }
                                     return (
                                         <Box sx={{ pointerEvents: 'auto' }}>
-                                           <IconButton size="small" sx={{ bgcolor: 'rgba(0,0,0,0.6)', color: '#fff', '&:hover': { bgcolor: 'rgba(0,0,0,0.8)' } }} onClick={(e) => { e.stopPropagation(); downloadFile(att.decryptedUrl || att.url, att.originalName); }}>
+                                           <IconButton size="small" sx={{ bgcolor: 'rgba(0,0,0,0.6)', color: '#fff', '&:hover': { bgcolor: 'rgba(0,0,0,0.8)' } }} onClick={(e) => { e.stopPropagation(); downloadFile(att.url, att.originalName, att.binaryAesKey ? { aesKey: att.binaryAesKey, iv: att.binaryIv, mimeType: att.originalMimeType } : null); }}>
                                               <FileDownloadIcon fontSize="small" />
                                            </IconButton>
                                         </Box>
@@ -359,7 +378,7 @@ const MessageBubble = React.forwardRef(({
                    onClick={(e) => { 
                        e.stopPropagation(); 
                        if(isUploading || hasFailed) return;
-                       if(!isDownloading) downloadFile(att.decryptedUrl || att.url, att.originalName); 
+                       if(!isDownloading) downloadFile(att.url, att.originalName, att.binaryAesKey ? { aesKey: att.binaryAesKey, iv: att.binaryIv, mimeType: att.originalMimeType } : null); 
                    }}
                  >
                     <Box sx={{ position: 'relative', mr: 1, display: 'flex' }}>
@@ -402,7 +421,7 @@ const MessageBubble = React.forwardRef(({
                          <Button size="small" sx={{ color: '#00a884', textTransform: 'none', fontWeight: 'bold' }} onClick={(e) => { 
                              e.stopPropagation(); 
                              if (note.status === 'failed' || uploadState?.status === 'failed') retryTask(note._id);
-                             else if (downloadState?.status === 'failed') { retryTask(att.url) || downloadFile(att.decryptedUrl || att.url, att.originalName); }
+                             else if (downloadState?.status === 'failed') { retryTask(att.url) || downloadFile(att.url, att.originalName, att.binaryAesKey ? { aesKey: att.binaryAesKey, iv: att.binaryIv, mimeType: att.originalMimeType } : null); }
                          }}>
                             Retry
                          </Button>
@@ -413,7 +432,7 @@ const MessageBubble = React.forwardRef(({
                          )}
                        </Box>
                     ) : (
-                       <IconButton size="small" sx={{ color: "#aebac1" }} onClick={(e) => { e.stopPropagation(); downloadFile(att.decryptedUrl || att.url, att.originalName); }}>
+                       <IconButton size="small" sx={{ color: "#aebac1" }} onClick={(e) => { e.stopPropagation(); downloadFile(att.url, att.originalName, att.binaryAesKey ? { aesKey: att.binaryAesKey, iv: att.binaryIv, mimeType: att.originalMimeType } : null); }}>
                           <FileDownloadIcon fontSize="small" />
                        </IconButton>
                     )}

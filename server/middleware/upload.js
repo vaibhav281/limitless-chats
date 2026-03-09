@@ -22,10 +22,23 @@ const allowedTypes = [
     "image/png",
     "image/jpg",
     "image/webp",
+    "image/gif",
+    "image/svg+xml",
+    "video/mp4",
+    "video/webm",
+    "video/quicktime",
+    "audio/mp3",
+    "audio/mpeg",
+    "audio/wav",
+    "audio/ogg",
     "application/pdf",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.ms-excel",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     "application/zip",
     "application/x-zip-compressed",
-    "video/mp4",
+    "text/plain",
     "application/octet-stream" // fallback for E2EE blobs
 ];
 
@@ -38,7 +51,7 @@ const fileFilter = (req, file, cb) => {
         cb(null, true);
     } else {
         // Fallback to checking extension if mimetype is weird
-        const extRegex = /jpeg|jpg|png|gif|mp4|avi|webm|mov|mkv|wmv|flv|pdf|doc|docx|txt|xls|xlsx|ppt|pptx|zip|rar|mp3|wav|mpeg|enc/;
+        const extRegex = /jpeg|jpg|png|gif|svg|mp4|avi|webm|mov|mkv|wmv|flv|pdf|doc|docx|txt|xls|xlsx|ppt|pptx|zip|rar|mp3|wav|mpeg|enc/;
         const extMatch = extRegex.test(path.extname(file.originalname).toLowerCase());
 
         if (extMatch) {

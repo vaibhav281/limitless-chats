@@ -3,6 +3,8 @@ import useNotes from "../hooks/useNotes";
 import useFileUpload from "../hooks/useFileUpload";
 import useEncryptedMessaging from "../hooks/useEncryptedMessaging";
 import { Box, Paper, IconButton, Typography, Modal, TextField, Button, Dialog, Fade, Fab } from "@mui/material";
+import { saveMessageLocally } from "../features/encryption/localMessageStore";
+import { mediaKeyCache } from "../features/encryption/mediaKeyCache";
 import InfiniteScroll from "react-infinite-scroll-component";
 import ContentCopyIcon from "@mui/icons-material/ContentCopy";
 import DeleteIcon from "@mui/icons-material/Delete";
@@ -49,7 +51,7 @@ export default function DailyNotesPage() {
   }, []);
 
   const [chatWithId, setChatWithId] = useState(null);
-  const { notes, setNotes, loadLatest, loadOlder, addNote, deleteNote, deleteMany, pinNote, unpinNote, hasMore, fetchNotes, activeUsers, userId, editNote, unreadCounts, setUnreadCounts, conversations, socket } = useNotes(20, chatWithId, username);
+  const { notes, setNotes, loadLatest, loadOlder, addNote, deleteNote, deleteMany, pinNote, unpinNote, hasMore, fetchNotes, activeUsers, userId, editNote, unreadCounts, setUnreadCounts, conversations, socket, cacheSentMessage } = useNotes(20, chatWithId, username);
   const { fileProgress, uploadFiles, downloadFile, cancelTask, retryTask } = useFileUpload();
   const { encryptOutgoing } = useEncryptedMessaging(userId);
 
@@ -153,6 +155,25 @@ export default function DailyNotesPage() {
   const handleFileSelect = (e) => {
     const files = Array.from(e.target.files);
     if (!files.length) return;
+
+    const SUPPORTED_FILE_TYPES = [
+      "image/jpeg", "image/png", "image/jpg", "image/webp", "image/gif", "image/svg+xml",
+      "video/mp4", "video/webm", "video/quicktime",
+      "audio/mp3", "audio/mpeg", "audio/wav", "audio/ogg",
+      "application/pdf", "application/msword",
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      "application/vnd.ms-excel",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "application/zip", "application/x-zip-compressed", "text/plain"
+    ];
+
+    const unsupportedFiles = files.filter(f => !SUPPORTED_FILE_TYPES.includes(f.type) && !f.name.endsWith('.enc'));
+    if (unsupportedFiles.length > 0) {
+       alert(`Some files are not supported: ${unsupportedFiles.map(f => f.name).join(', ')}`);
+       e.target.value = null;
+       return;
+    }
+
     const newPreviews = files.map(file => {
        const url = URL.createObjectURL(file);
        const mime = file.type;
@@ -175,11 +196,30 @@ export default function DailyNotesPage() {
     const formData = new FormData();
     const textTarget = caption.trim() || "";
     
+    // Extract optimistic thumbnails
+    const optimisticAttachments = previewFiles.map(pf => ({
+       url: pf.url, // objectURL already created via handleFileSelect
+       type: pf.type,
+       originalName: pf.origName,
+       size: pf.file?.size
+    }));
+
     // Perform E2EE Encryption on text and files
     // The encryptOutgoing hook will AES-GCM encrypt the blob and Double Ratchet the file keys
     let ciphertext, type, encryptedFiles;
     try {
         ({ ciphertext, type, encryptedFiles } = await encryptOutgoing(chatWithId, textTarget, previewFiles));
+        
+        // Merge binary encryption details into optimisticAttachments for local caching
+        encryptedFiles.forEach((ef, idx) => {
+           if (optimisticAttachments[idx]) {
+               optimisticAttachments[idx].binaryAesKey = ef.binaryAesKey;
+               optimisticAttachments[idx].binaryIv = ef.binaryIv;
+               optimisticAttachments[idx].originalMimeType = ef.originalMimeType;
+           }
+        });
+
+        cacheSentMessage(ciphertext, textTarget, optimisticAttachments);
     } catch (err) {
         alert(`Could not securely encrypt attachments: ${err.message}`);
         setPreviewFiles([]); setCaption(""); setOpenPreview(false); setReplyingTo(null); setEditingNote(null);
@@ -196,23 +236,30 @@ export default function DailyNotesPage() {
     formData.append('receiverId', chatWithId);
     if(replyingTo) formData.append('replyTo', replyingTo._id);
 
+    const attachmentsMeta = [];
+
     encryptedFiles.forEach(ef => {
        if(ef.blob) {
-         formData.append('attachments', ef.blob, ef.originalName);
-         formData.append('encryptedKeys', ef.encryptedKey);
-         formData.append('keyTypes', ef.keyType);
-         formData.append('ivs', ef.iv);
-         formData.append('mimeTypes', ef.originalMimeType);
+         formData.append('files', ef.blob, ef.originalName);
+         
+         // Build structured metadata
+         let parsedMap = {};
+         try {
+             parsedMap = JSON.parse(ef.encryptedKeysMap);
+         } catch (e) {
+             console.warn("Could not parse keys map for metadata", e);
+         }
+
+         attachmentsMeta.push({
+             encryptedKeysMap: parsedMap,
+             iv: ef.iv,
+             originalMimeType: ef.originalMimeType,
+             type: ef.type
+         });
        } else console.warn("Missing file blob for", ef);
     });
 
-    // Extract optimistic thumbnails
-    const optimisticAttachments = previewFiles.map(pf => ({
-       url: pf.url, // objectURL already created via handleFileSelect
-       type: pf.type,
-       originalName: pf.origName,
-       size: pf.file?.size
-    }));
+    formData.append('attachmentsMeta', JSON.stringify(attachmentsMeta));
 
     const tempId = "temp-" + Date.now();
     const tempNote = {
@@ -234,15 +281,39 @@ export default function DailyNotesPage() {
 
     try {
       const realNote = await uploadFiles(tempId, formData);
+      
+      const realNoteForSender = {
+          ...realNote,
+          noteText: textTarget,
+          attachments: optimisticAttachments,
+          isDecrypted: true,
+          status: 'sent'
+      };
+
+      await saveMessageLocally(realNoteForSender);
+
+      // Also cache for the Secure pipeline (mediaKeyCache)
+      await mediaKeyCache.saveMediaKey(userId, realNote._id, 'text', {
+          decryptedText: textTarget
+      });
+
+      for (let i = 0; i < optimisticAttachments.length; i++) {
+          await mediaKeyCache.saveMediaKey(userId, realNote._id, i, {
+              aesKey: optimisticAttachments[i].binaryAesKey
+          });
+      }
+
       // Backend returned the new Document. The Socket may have already emitted and added it to the array.
       setNotes(prev => {
          const alreadyExists = prev.some(n => n._id === realNote._id);
          if (alreadyExists) {
-            // Socket already inserted it. Just remove the temporary uploading mock.
-            return prev.filter(n => n._id !== tempId);
+            // Socket already inserted it. Filter out tempId, and OVERWRITE socket's version with secure local version
+            return prev
+              .filter(n => n._id !== tempId)
+              .map(n => n._id === realNote._id ? realNoteForSender : n);
          }
          // Socket hasn't fired yet. Swap the temporary mock with the verified real note.
-         return prev.map(n => n._id === tempId ? realNote : n);
+         return prev.map(n => n._id === tempId ? realNoteForSender : n);
       });
     } catch(err) {
       console.error("Upload failed", err);
@@ -592,7 +663,14 @@ export default function DailyNotesPage() {
                   <img src={viewingMedia.items[viewingMedia.currentIndex].url} alt="enlarged" style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain" }} />
                ) : viewingMedia?.items[viewingMedia.currentIndex]?.type === 'video' ? (
                   <video src={viewingMedia.items[viewingMedia.currentIndex].url} controls controlsList="nodownload" autoPlay style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain" }} />
-               ) : null}
+               ) : (viewingMedia?.items[viewingMedia.currentIndex]?.type === 'document' || viewingMedia?.items[viewingMedia.currentIndex]?.type === 'archive') ? (
+                  <iframe src={viewingMedia.items[viewingMedia.currentIndex].url} style={{ width: "100%", height: "100%", border: "none" }} title="Document Viewer" />
+               ) : (
+                  <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2 }}>
+                     <Typography sx={{ color: '#fff' }}>Preview not available for this file type.</Typography>
+                     <Button variant="contained" href={viewingMedia?.items[viewingMedia.currentIndex]?.url} download={viewingMedia?.items[viewingMedia.currentIndex]?.originalName}>Download File</Button>
+                  </Box>
+               )}
             </Box>
             
             {/* Multiple media thumbnails carousel */}

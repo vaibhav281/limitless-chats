@@ -4,6 +4,26 @@ import useSocket from './useSocket';
 import useMessageStatus from './useMessageStatus';
 import useEncryptedMessaging from './useEncryptedMessaging';
 import { saveMessageLocally, getMessageLocally } from '../features/encryption/localMessageStore';
+import { mediaKeyCache } from '../features/encryption/mediaKeyCache';
+import { MessageLifecycleManager } from '../features/encryption/MessageLifecycleManager';
+
+// Helper to reliably merge notes chronologically (Adjustment 3)
+function mergeMessages(existing, incoming) {
+  const all = [...existing, ...incoming];
+  const unique = [];
+  const seen = new Set();
+
+  // Sort by timestamp newest first (index 0 is newest)
+  all.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+
+  for (const m of all) {
+    if (!seen.has(m._id)) {
+      seen.add(m._id);
+      unique.push(m);
+    }
+  }
+  return unique;
+}
 
 export default function useNotes(initialLimit = 20, chatWithId = null, username = "") {
   const [userId] = useState(() => {
@@ -36,24 +56,24 @@ export default function useNotes(initialLimit = 20, chatWithId = null, username 
     if (!socket) return;
 
     socket.on('newNote', async (rawNote) => {
-      // 1. If we sent this message, we CANNOT logically decrypt it since ratchets are asymmetric.
-      // We must pull the plaintext version from our local optimistic store or in-flight cache.
-      let note;
-      if (rawNote.senderId === userId) {
-        if (sentMessagesCache.current.has(rawNote.ciphertext)) {
-          note = { ...rawNote, noteText: sentMessagesCache.current.get(rawNote.ciphertext), isDecrypted: true };
+      // 1. Pull optimistic text if we sent it
+      let rawNoteToProcess = rawNote;
+      if (rawNote.senderId === userId && sentMessagesCache.current.has(rawNote.ciphertext)) {
+        const cachedPayload = sentMessagesCache.current.get(rawNote.ciphertext);
+        if (typeof cachedPayload === 'string') {
+          rawNoteToProcess = { ...rawNote, noteText: cachedPayload, isDecrypted: true };
         } else {
-          const cachedLocal = await getMessageLocally(rawNote._id);
-          if (cachedLocal) {
-            note = { ...rawNote, noteText: cachedLocal.noteText, isDecrypted: true };
-          } else {
-            note = { ...rawNote, noteText: "🔐 Message sent from another device or storage cleared", isDecrypted: false };
-          }
+          rawNoteToProcess = {
+            ...rawNote,
+            noteText: cachedPayload.text,
+            attachments: cachedPayload.attachments || [],
+            isDecrypted: true
+          };
         }
-      } else {
-        // It's an incoming message, decrypt it normally.
-        note = await decryptIncoming(rawNote);
       }
+
+      // 2. CENTRAL MESSAGE LIFECYCLE PIPELINE (Adjustment 5: UI doesn't talk directly to Crypto)
+      const note = await MessageLifecycleManager.processMessage(rawNoteToProcess, decryptIncoming);
 
       // Determine if this note belongs to the currently perfectly focused chat
       let isRelevant = false;
@@ -68,19 +88,8 @@ export default function useNotes(initialLimit = 20, chatWithId = null, username 
           (note.senderId === userId && note.receiverId === chatWithId);
       }
 
-      // CRITICAL FIX: Always save successfully decrypted incoming messages locally!
-      // Signal Double Ratchet consumes the ephemeral key upon decryption.
-      // If we don't save the plaintext now, opening the chat later will fetch the ciphertext,
-      // attempt to decrypt it again, and fail with "MessageCounterError".
-      if (note.senderId !== userId && note.isDecrypted) {
-        saveMessageLocally(note);
-      }
-
       if (isRelevant) {
-        setNotes(prev => {
-          if (prev.some(n => n._id === note._id)) return prev;
-          return [note, ...prev];
-        });
+        setNotes(prev => mergeMessages(prev, [note]));
 
         // Immediately mark this incoming socket message as read natively
         if (note.senderId !== userId) {
@@ -181,38 +190,22 @@ export default function useNotes(initialLimit = 20, chatWithId = null, username 
     loadingRef.current = true;
     try {
       const rawData = await fetchNotes({ limit: initialLimit, userId, chatWithId });
-      // Decrypt all fetched messages using cache to prevent Double Ratchet Consumption Error
-      // Decrypt strictly sequentially from oldest to newest to completely prevent Double Ratchet race conditions
-      const data = new Array(rawData.length);
-      for (let i = rawData.length - 1; i >= 0; i--) {
-        const n = rawData[i];
-        if (!n.ciphertext) {
-          data[i] = { ...n, noteText: n.noteText || "🔐 Decryption error", isDecrypted: false };
-          continue;
-        }
-        const local = await getMessageLocally(n._id);
-        if (local) {
-          data[i] = local;
-          continue;
-        }
 
-        if (n.senderId === userId) {
-          data[i] = { ...n, noteText: "🔐 Message sent from another device or storage cleared", isDecrypted: false };
-          continue;
-        }
+      // Reverse raw data so the pipeline processes sequentially from oldest to newest
+      const reversedRaw = [...rawData].reverse();
 
-        const decrypted = await decryptIncoming(n);
-        if (decrypted.isDecrypted) {
-          await saveMessageLocally(decrypted);
-        }
-        data[i] = decrypted;
-      }
+      // Execute the centralized Incremental Pipeline
+      const data = await MessageLifecycleManager.processMessages(reversedRaw, decryptIncoming);
+
+      // Ensure the UI state remains perfectly ordered newest-first
+      data.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+
       setNotes(data);
       setHasMore(data.length === initialLimit);
     } finally {
       loadingRef.current = false;
     }
-  }, [initialLimit, userId, chatWithId]);
+  }, [initialLimit, userId, chatWithId, decryptIncoming]);
 
   const loadOlder = useCallback(async () => {
     if (loadingRef.current || !notes.length || !chatWithId) return;
@@ -224,88 +217,68 @@ export default function useNotes(initialLimit = 20, chatWithId = null, username 
         setHasMore(false);
         return;
       }
-      // Decrypt strictly sequentially from oldest to newest to completely prevent Double Ratchet race conditions
-      const data = new Array(rawData.length);
-      for (let i = rawData.length - 1; i >= 0; i--) {
-        const n = rawData[i];
-        if (!n.ciphertext) {
-          data[i] = { ...n, noteText: n.noteText || "🔐 Decryption error", isDecrypted: false };
-          continue;
-        }
-        const local = await getMessageLocally(n._id);
-        if (local) {
-          data[i] = local;
-          continue;
-        }
 
-        if (n.senderId === userId) {
-          data[i] = { ...n, noteText: "🔐 Message sent from another device or storage cleared", isDecrypted: false };
-          continue;
-        }
+      const reversedRaw = [...rawData].reverse();
+      const data = await MessageLifecycleManager.processMessages(reversedRaw, decryptIncoming);
 
-        const decrypted = await decryptIncoming(n);
-        if (decrypted.isDecrypted) {
-          await saveMessageLocally(decrypted);
-        }
-        data[i] = decrypted;
-      }
-      setNotes(prev => [...prev, ...data]);
+      setNotes(prev => mergeMessages(prev, data));
       setHasMore(data.length === initialLimit);
     } finally {
       loadingRef.current = false;
     }
-  }, [initialLimit, notes, userId, chatWithId]);
+  }, [initialLimit, notes, userId, chatWithId, decryptIncoming]);
 
   const addNote = useCallback(async (noteData, replyTo = null) => {
     if (!chatWithId) return null;
     let payload;
     const senderName = username || "Anonymous";
-
-    // 1. Encrypt Outgoing Data
-    const plaintext = typeof noteData === 'string' ? noteData : noteData.get('noteText');
-    let ciphertext, type, encryptedFiles;
-    try {
-      ({ ciphertext, type, encryptedFiles } = await encryptOutgoing(chatWithId, plaintext, []));
-      sentMessagesCache.current.set(ciphertext, plaintext);
-    } catch (err) {
-      alert(`Could not securely encrypt message: ${err.message}`);
-      return null; // Halt message transmission
-    }
+    let finalOptimisticNote;
 
     try {
       if (typeof noteData === 'string') {
+        const plaintext = noteData;
+        let ciphertext, type;
+
+        ({ ciphertext, type } = await encryptOutgoing(chatWithId, plaintext, []));
+        sentMessagesCache.current.set(ciphertext, plaintext);
+
         payload = { ciphertext, type, replyTo, senderName, senderId: userId, receiverId: chatWithId };
+        const newNote = await createNote(payload);
+
+        finalOptimisticNote = {
+          ...newNote,
+          _id: newNote._id || Date.now().toString(),
+          noteText: plaintext,
+          status: "sent"
+        };
+
+        setNotes(prev => {
+          if (prev.some(n => n._id === finalOptimisticNote._id)) return prev;
+          return [finalOptimisticNote, ...prev];
+        });
+
       } else {
-        // Support for attachments (TODO: Map encryptedFiles blobs into FormData properly)
+        // Support for attachments (DailyNotesPage already encrypted and appended to FormData)
         payload = noteData;
-        payload.append('ciphertext', ciphertext);
-        payload.append('type', type);
-        payload.append('senderName', senderName);
-        payload.append('senderId', userId);
-        payload.append('receiverId', chatWithId);
-        if (replyTo) {
-          payload.append('replyTo', replyTo);
-        }
+        const newNote = await createNote(payload);
+
+        finalOptimisticNote = {
+          ...newNote,
+          status: "sent"
+        };
       }
-      const newNote = await createNote(payload);
 
-      // We update local state immediately for snappy UI,
-      // Socket will ignore duplicate due to the effect logic.
-      const optimisticNote = {
-        ...newNote,
-        _id: newNote._id || Date.now().toString(), // fallback if somehow not returned
-        noteText: plaintext, // Restore the plaintext only for the local optimistic UI
-        status: "sent" // Optimistic UI
-      };
+      await saveMessageLocally(finalOptimisticNote); // Cache our own sent message
 
-      await saveMessageLocally(optimisticNote); // Cache our own sent message
+      if (typeof noteData === 'string') {
+        await mediaKeyCache.saveMediaKey(userId, finalOptimisticNote._id, 'text', {
+          decryptedText: noteData
+        });
+      }
 
-      setNotes(prev => {
-        if (prev.some(n => n._id === optimisticNote._id)) return prev;
-        return [optimisticNote, ...prev];
-      });
-      return optimisticNote;
+      return finalOptimisticNote;
     } catch (err) {
+      console.error(err);
       alert(err.message || "Encryption and Delivery Failed");
       return null;
     }
@@ -379,6 +352,10 @@ export default function useNotes(initialLimit = 20, chatWithId = null, username 
     }
   }, [chatWithId, loadLatest]);
 
+  const cacheSentMessage = useCallback((cText, plainText, plainAttachments) => {
+    sentMessagesCache.current.set(cText, { text: plainText, attachments: plainAttachments });
+  }, []);
+
   return {
     notes,
     setNotes,
@@ -397,6 +374,7 @@ export default function useNotes(initialLimit = 20, chatWithId = null, username 
     unreadCounts,
     setUnreadCounts,
     conversations,
-    socket
+    socket,
+    cacheSentMessage
   };
 }

@@ -5,7 +5,15 @@ const Note = require("../models/Note");
 const upload = require("../middleware/upload");
 
 // @route   POST /api/v1/notes
-router.post("/", upload.array("attachments"), async (req, res) => {
+router.post("/", (req, res, next) => {
+  upload.array("files")(req, res, function (err) {
+    if (err) {
+      console.error("Multer Error:", err.message);
+      return res.status(400).json({ message: err.message || "Unsupported file upload error" });
+    }
+    next();
+  });
+}, async (req, res) => {
   try {
     const { ciphertext, type: messageType, replyTo, senderName, senderId, receiverId, isGroup } = req.body;
 
@@ -16,33 +24,36 @@ router.post("/", upload.array("attachments"), async (req, res) => {
     let attachments = [];
 
     if (req.files && req.files.length > 0) {
-      // Form-Data might send a single string or an array depending on the count
-      const eKeys = Array.isArray(req.body.encryptedKeys) ? req.body.encryptedKeys : [req.body.encryptedKeys];
-      const iVars = Array.isArray(req.body.ivs) ? req.body.ivs : [req.body.ivs];
-      const kTypes = Array.isArray(req.body.keyTypes) ? req.body.keyTypes : [req.body.keyTypes];
-      const mMimes = Array.isArray(req.body.mimeTypes) ? req.body.mimeTypes : [req.body.mimeTypes];
+      let metaData = [];
+      try {
+        metaData = JSON.parse(req.body.attachmentsMeta || "[]");
+      } catch (e) {
+        console.warn("Could not parse attachmentsMeta JSON array", e);
+      }
 
       attachments = req.files.map((file, i) => {
+        const meta = metaData[i] || {};
         const mime = file.mimetype;
         const ext = file.originalname.split('.').pop().toLowerCase();
-        let type = "other";
+        let type = meta.type || "other";
 
-        if (mime.startsWith("image")) type = "image";
-        else if (mime.startsWith("video")) type = "video";
-        else if (mime.startsWith("audio")) type = "audio";
-        else if (["pdf", "doc", "docx", "txt", "xls", "xlsx", "ppt", "pptx"].includes(ext)) type = "document";
-        else if (["zip", "rar", "7z", "tar"].includes(ext)) type = "archive";
+        if (!meta.type) {
+          if (mime.startsWith("image")) type = "image";
+          else if (mime.startsWith("video")) type = "video";
+          else if (mime.startsWith("audio")) type = "audio";
+          else if (["pdf", "doc", "docx", "txt", "xls", "xlsx", "ppt", "pptx"].includes(ext)) type = "document";
+          else if (["zip", "rar", "7z", "tar"].includes(ext)) type = "archive";
+        }
 
         return {
           url: `/uploads/${file.filename}`, // Actually stored as ciphertext flat blob
           encryptedBlobUrl: `/uploads/${file.filename}`,
           type,
-          originalMimeType: mMimes[i] || mime,
+          originalMimeType: meta.originalMimeType || mime,
           originalName: file.originalname,
           size: file.size,
-          encryptedKey: eKeys[i],
-          keyType: parseInt(kTypes[i], 10) || 3,
-          iv: iVars[i]
+          encryptedKeys: meta.encryptedKeysMap || {},
+          iv: meta.iv
         };
       });
     }

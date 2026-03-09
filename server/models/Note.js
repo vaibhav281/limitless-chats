@@ -15,8 +15,13 @@ const noteSchema = new mongoose.Schema(
                 originalName: { type: String },
                 size: { type: Number }, // File size in bytes
                 encryptedBlobUrl: { type: String },
-                encryptedKey: { type: String },
-                keyType: { type: Number },
+                encryptedKeys: {
+                    type: Map,
+                    of: new mongoose.Schema({
+                        key: { type: String },
+                        type: { type: Number }
+                    }, { _id: false })
+                },
                 iv: { type: String }
             },
         ],
