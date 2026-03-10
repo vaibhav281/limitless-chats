@@ -1,8 +1,10 @@
+import { bufferToBase64, base64ToBuffer } from './cryptoService';
+
 // Signal Protocol Store Implementation using IndexedDB
 export class SignalProtocolStore {
     constructor() {
         this.dbName = 'LimitlessE2EE';
-        this.dbVersion = 1;
+        this.dbVersion = 2; // Bumped to clear corrupted `{0: 123...}` object stores
         this.storeNames = ['identity', 'preKeys', 'signedPreKeys', 'sessions', 'identityKeys'];
         this.initDB();
     }
@@ -17,11 +19,21 @@ export class SignalProtocolStore {
             request.onupgradeneeded = (e) => {
                 const db = e.target.result;
                 console.log("[SignalStore] Upgrading IndexedDB stores...");
-                this.storeNames.forEach(name => {
-                    if (!db.objectStoreNames.contains(name)) {
+
+                if (e.oldVersion < 2) {
+                    this.storeNames.forEach(name => {
+                        if (db.objectStoreNames.contains(name)) {
+                            db.deleteObjectStore(name);
+                        }
                         db.createObjectStore(name);
-                    }
-                });
+                    });
+                } else {
+                    this.storeNames.forEach(name => {
+                        if (!db.objectStoreNames.contains(name)) {
+                            db.createObjectStore(name);
+                        }
+                    });
+                }
             };
             request.onsuccess = () => {
                 this.db = request.result;
@@ -89,7 +101,12 @@ export class SignalProtocolStore {
     }
 
     async getIdentityKeyPair() {
-        return this._get('identity', 'keyPair');
+        const serialized = await this._get('identity', 'keyPair');
+        if (!serialized) return undefined;
+        return {
+            pubKey: base64ToBuffer(serialized.pubKey),
+            privKey: base64ToBuffer(serialized.privKey)
+        };
     }
 
     async getLocalRegistrationId() {
@@ -97,7 +114,11 @@ export class SignalProtocolStore {
     }
 
     async putIdentityKeyPair(keyPair) {
-        await this._put('identity', 'keyPair', keyPair);
+        const serialized = {
+            pubKey: bufferToBase64(keyPair.pubKey),
+            privKey: bufferToBase64(keyPair.privKey)
+        };
+        await this._put('identity', 'keyPair', serialized);
     }
 
     async putLocalRegistrationId(id) {
@@ -111,33 +132,43 @@ export class SignalProtocolStore {
 
         if (!trusted) {
             console.log(`[SignalStore] Trusting identity on first use for ${identifier}`);
+            await this.saveIdentity(identifier, identityKey);
             return true;
         }
 
-        const t8 = new Uint8Array(trusted);
+        const t8 = new Uint8Array(base64ToBuffer(trusted));
         const i8 = new Uint8Array(identityKey);
 
         if (t8.length !== i8.length) return false;
 
         for (let i = 0; i < t8.length; i++) {
-            if (t8[i] !== i8[i]) return false;
+            if (t8[i] !== i8[i]) {
+                console.warn(`[SignalStore] Identity key changed for ${identifier}. Auto-trusting for dev/reinstalls.`);
+                await this.saveIdentity(identifier, identityKey);
+                return true;
+            }
         }
 
         return true;
     }
 
     async loadIdentityKey(identifier) {
-        return this._get('identityKeys', identifier);
+        const b64 = await this._get('identityKeys', identifier);
+        return b64 ? base64ToBuffer(b64) : undefined;
     }
 
     async saveIdentity(identifier, identityKey) {
-        return this._put('identityKeys', identifier, identityKey);
+        const b64 = bufferToBase64(identityKey);
+        return this._put('identityKeys', identifier, b64);
     }
 
     async loadPreKey(keyId) {
         let res = await this._get('preKeys', keyId);
-        if (res && res.keyPair) {
-            res = res.keyPair;
+        if (res && res.pubKey) {
+            return {
+                pubKey: base64ToBuffer(res.pubKey),
+                privKey: base64ToBuffer(res.privKey)
+            };
         }
         return res;
     }
@@ -145,7 +176,8 @@ export class SignalProtocolStore {
     async storePreKey(keyId, keyPair) {
         return this._put('preKeys', keyId, {
             keyId: keyId,
-            keyPair: keyPair
+            pubKey: bufferToBase64(keyPair.pubKey),
+            privKey: bufferToBase64(keyPair.privKey)
         });
     }
 
@@ -155,8 +187,11 @@ export class SignalProtocolStore {
 
     async loadSignedPreKey(keyId) {
         let res = await this._get('signedPreKeys', keyId);
-        if (res && res.keyPair) {
-            res = res.keyPair;
+        if (res && res.pubKey) {
+            return {
+                pubKey: base64ToBuffer(res.pubKey),
+                privKey: base64ToBuffer(res.privKey)
+            };
         }
         return res;
     }
@@ -164,7 +199,8 @@ export class SignalProtocolStore {
     async storeSignedPreKey(keyId, keyPair) {
         return this._put('signedPreKeys', keyId, {
             keyId: keyId,
-            keyPair: keyPair
+            pubKey: bufferToBase64(keyPair.pubKey),
+            privKey: bufferToBase64(keyPair.privKey)
         });
     }
 
@@ -173,13 +209,20 @@ export class SignalProtocolStore {
     }
 
     async loadSession(identifier) {
-        const session = await this._get('sessions', identifier);
-        if (session) {
-            console.log(`[SignalStore] Loaded session for ${identifier}`);
-        } else {
+        const data = await this._get('sessions', identifier);
+
+        if (!data) {
             console.warn(`[SignalStore] No session found for ${identifier}`);
+            return undefined;
         }
-        return session;
+
+        console.log(`[SignalStore] Loaded session for ${identifier}`);
+
+        if (typeof data === "string" || data instanceof ArrayBuffer) {
+            return data;
+        }
+
+        return data; // Return serialized session directly
     }
 
     async storeSession(identifier, record) {

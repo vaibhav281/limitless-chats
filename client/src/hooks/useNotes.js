@@ -5,6 +5,7 @@ import useMessageStatus from './useMessageStatus';
 import useEncryptedMessaging from './useEncryptedMessaging';
 import { saveMessageLocally, getMessageLocally } from '../features/encryption/localMessageStore';
 import { mediaKeyCache } from '../features/encryption/mediaKeyCache';
+import { blobCache } from '../features/encryption/blobCache';
 import { MessageLifecycleManager } from '../features/encryption/MessageLifecycleManager';
 
 // Helper to reliably merge notes chronologically (Adjustment 3)
@@ -249,6 +250,7 @@ export default function useNotes(initialLimit = 20, chatWithId = null, username 
           ...newNote,
           _id: newNote._id || Date.now().toString(),
           noteText: plaintext,
+          isDecrypted: true,
           status: "sent"
         };
 
@@ -262,10 +264,53 @@ export default function useNotes(initialLimit = 20, chatWithId = null, username 
         payload = noteData;
         const newNote = await createNote(payload);
 
+        let noteText = "";
+        let finalAttachments = newNote.attachments || [];
+        const cachedSentInfo = sentMessagesCache.current.get(newNote.ciphertext);
+
+        if (cachedSentInfo) {
+          noteText = cachedSentInfo.text || "";
+          if (cachedSentInfo.attachments) {
+            finalAttachments = newNote.attachments.map((srvAtt, idx) => {
+              // Push the volatile blob URL into RAM (LRU Cache) so it survives for instant preview without network fetch
+              // but DO NOT commit it to IndexedDB, as blob URLs expire on page fresh!
+              const attachId = srvAtt.attachmentId || srvAtt.fileIndex || idx;
+              const volatileBlobUrl = cachedSentInfo.attachments[idx]?.url;
+              if (volatileBlobUrl && volatileBlobUrl.startsWith('blob:')) {
+                blobCache.set(`${newNote._id}_${attachId}`, volatileBlobUrl);
+              }
+
+              return {
+                ...srvAtt,
+                url: srvAtt.url, // Strictly enforce the real Server API URL for DB Storage!
+                binaryAesKey: cachedSentInfo.attachments[idx]?.binaryAesKey,
+                binaryIv: cachedSentInfo.attachments[idx]?.binaryIv
+              };
+            });
+          }
+        }
+
         finalOptimisticNote = {
           ...newNote,
+          noteText: noteText,
+          attachments: finalAttachments,
+          isDecrypted: true,
           status: "sent"
         };
+
+        // Save SENDER media keys directly to DB so refresh doesn't break DecryptedMedia!
+        if (finalOptimisticNote.attachments && finalOptimisticNote.attachments.length > 0) {
+          for (const [idx, att] of finalOptimisticNote.attachments.entries()) {
+            if (att.binaryAesKey) {
+              const attachId = att.attachmentId || (att.fileIndex !== undefined ? att.fileIndex : idx);
+              await mediaKeyCache.saveMediaKey(userId, finalOptimisticNote._id, attachId, {
+                aesKey: att.binaryAesKey
+              });
+              delete att.binaryAesKey;
+              delete att.binaryIv;
+            }
+          }
+        }
       }
 
       await saveMessageLocally(finalOptimisticNote); // Cache our own sent message

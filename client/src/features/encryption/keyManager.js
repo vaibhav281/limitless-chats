@@ -37,7 +37,7 @@ export const generateAndUploadKeys = async (userId) => {
         // 3. Generate Signed Pre-Key
         const signedPreKeyId = 1;
         const signedPreKey = await KeyHelper.generateSignedPreKey(identityKeyPair, signedPreKeyId);
-        await signalStore.storeSignedPreKey(signedPreKeyId, signedPreKey);
+        await signalStore.storeSignedPreKey(signedPreKeyId, signedPreKey.keyPair);
 
         // 4. Generate One-Time Pre-Keys
         const publicPreKeys = [];

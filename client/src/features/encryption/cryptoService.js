@@ -77,11 +77,22 @@ export function base64ToUint8(base64) {
 }
 
 export function bufferToBase64(buffer) {
-    return Buffer.from(new Uint8Array(buffer)).toString("base64");
+    let binary = '';
+    const bytes = new Uint8Array(buffer);
+    const len = bytes.byteLength;
+    for (let i = 0; i < len; i++) {
+        binary += String.fromCharCode(bytes[i]);
+    }
+    return window.btoa(binary);
 }
 
 export function base64ToBuffer(base64) {
-    return Uint8Array.from(Buffer.from(base64, "base64")).buffer;
+    const binary = window.atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes.buffer;
 }
 
 /**

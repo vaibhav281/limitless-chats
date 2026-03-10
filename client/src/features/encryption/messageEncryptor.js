@@ -1,7 +1,7 @@
 import { SessionCipher, SignalProtocolAddress } from '@privacyresearch/libsignal-protocol-typescript';
 import { signalStore } from './keyManager';
 import { ensureSession } from './sessionManager';
-import { Buffer } from 'buffer';
+import { uint8ToBase64 } from './cryptoService';
 
 // Encrypts plaintext message into a Signal Ciphertext object
 export const encryptMessage = async (remoteUserId, plaintext) => {
@@ -23,9 +23,14 @@ export const encryptMessage = async (remoteUserId, plaintext) => {
         // Natively convert Libsignal binary strings/buffers to pure secure Base64 for JSON transit!
         let base64Body;
         if (typeof ciphertextObj.body === 'string') {
-            base64Body = Buffer.from(ciphertextObj.body, 'binary').toString('base64');
+            // Convert binary string to base64 completely natively
+            const charCodes = new Uint8Array(ciphertextObj.body.length);
+            for (let i = 0; i < ciphertextObj.body.length; i++) {
+                charCodes[i] = ciphertextObj.body.charCodeAt(i);
+            }
+            base64Body = uint8ToBase64(charCodes);
         } else {
-            base64Body = Buffer.from(ciphertextObj.body).toString('base64');
+            base64Body = uint8ToBase64(new Uint8Array(ciphertextObj.body));
         }
 
         return {

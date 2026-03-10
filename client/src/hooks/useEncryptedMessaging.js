@@ -4,11 +4,14 @@ import { encryptMessage } from '../features/encryption/messageEncryptor';
 import { decryptMessage } from '../features/encryption/messageDecryptor';
 import { encryptFile, decryptFile, uint8ToBase64, base64ToUint8, ensureUint8Array } from '../features/encryption/cryptoService';
 import { mediaKeyCache } from '../features/encryption/mediaKeyCache';
+import { signalStore } from '../features/encryption/keyManager';
+import { ensureSession } from '../features/encryption/sessionManager';
 import axios from 'axios';
 
 // Global mutex to ensure Signal ratchets are processed strictly sequentially across the entire session.
 // Since SignalStore is a singleton, the lock must also be global to this JS context.
 let globalSignalMutex = Promise.resolve();
+const sessionRepairLocks = new Set();
 
 export default function useEncryptedMessaging(userId) {
     const [isKeysReady, setIsKeysReady] = useState(false);
@@ -56,16 +59,8 @@ export default function useEncryptedMessaging(userId) {
                     }
                 }
 
-                // 3. Encrypt the *AES Key* for OURSELVES (multi-device/refresh resilience)
-                try {
-                    const encryptedKeyPayloadSender = await encryptMessage(userId, keyBase64);
-                    encryptedKeysMap[userId] = {
-                        key: encryptedKeyPayloadSender.body, // Natively base64 string from libsignal
-                        type: encryptedKeyPayloadSender.type
-                    };
-                } catch (err) {
-                    console.error("Failed to encrypt AES key for sender", err);
-                }
+                // Sender self-encryption removed: It caused redundant X3DH sessions and we already natively cache 
+                // the AES keys directly into indexedDB `mediaKeyCache` during the `addNote` UI step!
 
                 encryptedFiles.push({
                     // Supply stable attachmentId into the persistent payload mapping!
@@ -124,18 +119,50 @@ export default function useEncryptedMessaging(userId) {
             const remoteUserId = note.senderId === userId ? note.receiverId : note.senderId;
 
             let decryptedText = "";
+            let decryptResult = null;
+
             if (note.ciphertext) {
                 if (textCacheEntry && textCacheEntry.decryptedText) {
                     decryptedText = textCacheEntry.decryptedText;
                 } else if (note.senderId === userId) {
-                    // SENDER logic: If we are here after refresh, it means persistent cache missed.
-                    // We NEVER attempt Signal decryption for our own outgoing text ratchet.
+                    // SENDER logic: We NEVER attempt Signal decryption for our own outgoing text ratchet.
                     decryptedText = "🔐 Message sent (plaintext not in cache)";
                 } else {
                     try {
-                        decryptedText = await decryptMessage(remoteUserId, note.type, note.ciphertext);
-                        if (decryptedText === "__media__") {
+                        decryptResult = await decryptMessage(remoteUserId, note.type, note.ciphertext);
+
+                        // Automatic Session Repair (Bob wiped his app, Alice sends old Ratchet X3DH keys)
+                        if (decryptResult && typeof decryptResult === 'object' && decryptResult.error) {
+                            // strictly only rebuild session mathematically for PREKEY messages (type 3)!
+                            // WhisperMessages (type 1) throwing Bad MAC are legacy histories that should die gracefully
+                            if (note.type === 3 && (decryptResult.reason.includes("Invalid private key") || decryptResult.reason.includes("Bad MAC") || decryptResult.reason.includes("Missing Signed PreKey") || decryptResult.reason.includes("No record for device"))) {
+                                if (!sessionRepairLocks.has(remoteUserId)) {
+                                    sessionRepairLocks.add(remoteUserId);
+                                    console.warn(`[E2EE] Session desync for ${remoteUserId}. Rebuilding mathematically...`);
+
+                                    // 1. Remove the broken session natively
+                                    await signalStore.removeSession(`${remoteUserId}.1`);
+
+                                    // 2. fetch their NEW Key Bundle from the Server
+                                    await ensureSession(remoteUserId);
+
+                                    // 3. Try decrypting one more time with the fresh session
+                                    decryptResult = await decryptMessage(remoteUserId, note.type, note.ciphertext);
+
+                                    // Clear the lock after 10 seconds to allow future repairs if they wipe DB again
+                                    setTimeout(() => sessionRepairLocks.delete(remoteUserId), 10000);
+                                } else {
+                                    console.warn(`[E2EE] Skipping historical auto-repair loop for ${remoteUserId}.`);
+                                }
+                            }
+                        }
+
+                        if (decryptResult && typeof decryptResult === 'object' && decryptResult.error) {
+                            decryptedText = `🔐 ${decryptResult.reason}`;
+                        } else if (decryptResult === "__media__") {
                             decryptedText = ""; // Hide the placeholder from the UI
+                        } else {
+                            decryptedText = decryptResult;
                         }
                     } catch (e) {
                         console.error("Signal Decryption Failed:", e);
@@ -152,7 +179,9 @@ export default function useEncryptedMessaging(userId) {
 
             // 2. Decrypt Attachments (Strict Signal-Once Policy)
             const newKeysToCache = [];
-            if (restoredNote.attachments && restoredNote.attachments.length > 0) {
+            const textRatchetFailed = decryptResult && typeof decryptResult === 'object' && decryptResult.error;
+
+            if (!textRatchetFailed && restoredNote.attachments && restoredNote.attachments.length > 0) {
                 const decryptedAttachments = [];
 
                 for (let i = 0; i < restoredNote.attachments.length; i++) {

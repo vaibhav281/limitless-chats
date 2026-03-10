@@ -58,11 +58,12 @@ export const ensureSession = async (remoteUserId) => {
 
             console.log(`X3DH Session established with ${remoteUserId}.`);
         } catch (err) {
-            delete sessionLocks[remoteUserId];
             if (err.response && err.response.status === 404) {
                 throw new Error("User not initialized for encryption");
             }
             throw err;
+        } finally {
+            delete sessionLocks[remoteUserId];
         }
     })();
 

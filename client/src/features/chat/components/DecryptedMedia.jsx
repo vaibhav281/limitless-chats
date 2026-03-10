@@ -4,6 +4,8 @@ import PlayCircleIcon from '@mui/icons-material/PlayCircle';
 import axios from 'axios';
 import { decryptFile } from '../../encryption/cryptoService';
 import { blobCache } from '../../encryption/blobCache';
+import { mediaKeyCache } from '../../encryption/mediaKeyCache';
+import { persistentBlobStore } from '../../encryption/persistentBlobStore';
 
 export default function DecryptedMedia({ attachment, noteId, remoteUserId, isSentByMe, isSingle, isThreeGridFirst, extraCount }) {
   const [objectUrl, setObjectUrl] = useState(null);
@@ -14,26 +16,45 @@ export default function DecryptedMedia({ attachment, noteId, remoteUserId, isSen
     let active = true;
 
     const loadDecrypted = async () => {
-      // 1. If the file is an optimistic local blob (e.g., sender side preview before refresh)
-      // It is already plaintext. We DO NOT decrypt it, even if AES keys are attached for storage.
-      if (attachment.url && attachment.url.startsWith('blob:')) {
-         setObjectUrl(attachment.url);
-         setLoading(false);
-         return;
+      const effectiveId = attachment.attachmentId || (attachment.fileIndex !== undefined ? attachment.fileIndex : (attachment.index || attachment.originalName));
+      const cacheKey = `${noteId}_${effectiveId}`;
+
+      // 1. Check LRU RAM Cache (Optimistic / Previews)
+      let cachedUrl = blobCache.get(cacheKey);
+      
+      // Fallback for purely optimistic new items trying to render instantly
+      if (!cachedUrl && attachment.url && attachment.url.startsWith('blob:')) {
+          cachedUrl = attachment.url;
       }
 
-      // 1.5 Check LRU RAM Cache to prevent WebCrypto freezes on re-render / scrolling
-      const cacheKey = `${noteId}_${attachment.attachmentId || (attachment.fileIndex !== undefined ? attachment.fileIndex : (attachment.index || attachment.originalName))}`;
-      const cachedUrl = blobCache.get(cacheKey);
       if (cachedUrl) {
           setObjectUrl(cachedUrl);
           setLoading(false);
           return;
       }
 
-      // 2. Prioritize Production-Grade Binary Results from the persistent cache
-      const aesKey = attachment.binaryAesKey || attachment.decryptedKeyBase64;
-      const iv = attachment.binaryIv || attachment.iv;
+      // 2. Check Persistent IndexedDB Blob Store (WhatsApp-level media caching)
+      const cachedBlob = await persistentBlobStore.getMedia(noteId, effectiveId);
+      if (cachedBlob && active) {
+          const newObjectUrl = URL.createObjectURL(cachedBlob);
+          blobCache.set(cacheKey, newObjectUrl);
+          setObjectUrl(newObjectUrl);
+          setLoading(false);
+          return;
+      }
+
+      // 3. Network Fetch & Decryption Pipeline
+      const currentUserId = localStorage.getItem('userId');
+      
+      let aesKey = attachment.binaryAesKey || attachment.decryptedKeyBase64;
+      let iv = attachment.binaryIv || attachment.iv;
+
+      if (!aesKey) {
+          const cachedMediaKey = await mediaKeyCache.getMediaKey(currentUserId, noteId, effectiveId);
+          if (cachedMediaKey) {
+              aesKey = cachedMediaKey.aesKey || cachedMediaKey.binaryAesKey;
+          }
+      }
 
       if (aesKey && iv && attachment.url) {
          try {
@@ -50,6 +71,9 @@ export default function DecryptedMedia({ attachment, noteId, remoteUserId, isSen
                 iv,
                 resolvedMimeType
             );
+
+            // Push strictly to Persistent WhatsApp-Style Blob Store so it survives page refresh
+            await persistentBlobStore.saveMedia(noteId, effectiveId, decryptedBlob);
 
             const newObjectUrl = URL.createObjectURL(decryptedBlob);
             
@@ -85,11 +109,16 @@ export default function DecryptedMedia({ attachment, noteId, remoteUserId, isSen
 
     return () => {
       active = false;
-      // Memory cleanup for blob URLs is now strictly delegated to the `LRUBlobCache` class
-      // or the parent component (for optimistic sender uploads). Calling URL.revokeObjectURL 
-      // here would destroy the image while scrolling.
+      // Per Architect's specific request: safely revoke component-local blobs when unmounting
+      // to ensure ERR_FILE_NOT_FOUND issues from leaked memory states are resolved.
+      setObjectUrl(current => {
+          if (current && current.startsWith('blob:')) {
+              URL.revokeObjectURL(current);
+          }
+          return current;
+      });
     };
-  }, [attachment.url, attachment.originalName, attachment.attachmentId, attachment.fileIndex, attachment.type, remoteUserId, isSentByMe]);
+  }, [attachment.url, attachment.originalName, attachment.attachmentId, attachment.fileIndex, attachment.type, remoteUserId, isSentByMe, noteId]);
 
   if (loading) {
     return (

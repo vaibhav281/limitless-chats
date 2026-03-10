@@ -53,14 +53,43 @@ export const MessageLifecycleManager = {
             return { ...rawMessage, noteText: rawMessage.noteText || "🔐 Error: Missing ciphertext", isDecrypted: false };
         }
 
+        // If the socket or cache already hydrated the plaintext (e.g. sender's own message), skip crypto!
+        if (rawMessage.isDecrypted) {
+            return rawMessage;
+        }
+
         // 1. Check IndexedDB cache first (fast path)
         const local = await getMessageLocally(rawMessage._id);
         if (local) {
             return local;
         }
 
+        // SENDER SOCKET RACE FIX: Prevent Senders from decrypting their own websocket bounce-backs!
+        const currentUserId = localStorage.getItem('userId');
+        if (rawMessage.senderId === currentUserId) {
+            return {
+                ...rawMessage,
+                noteText: "🔐 Message sent (plaintext not in cache)",
+                isDecrypted: true,
+                permanentlyFailed: true
+            };
+        }
+
         // 2. Not cached. Must decrypt via Signal Protocol.
         const decryptedNote = await decryptIncomingFn(rawMessage);
+
+        // OLD RATCHET LOCK: If Signal Protocol catches Bad MAC / Session Desync for an old message,
+        // we permanently mark it as undecryptable and save it to IndexedDB so it never retries on refresh!
+        if (decryptedNote.noteText && decryptedNote.noteText.includes("🔐") &&
+            (decryptedNote.noteText.includes("Bad MAC") || decryptedNote.noteText.includes("No record for device") || decryptedNote.noteText.includes("Decryption error"))) {
+
+            decryptedNote.isDecrypted = false;
+            decryptedNote.permanentlyFailed = true;
+            decryptedNote.noteText = "🔐 Messages from previous session cannot be decrypted";
+
+            await saveMessageLocally(decryptedNote);
+            return decryptedNote;
+        }
 
         // 3. Extract and cache Media Keys (Adjustment 4)
         if (decryptedNote.isDecrypted && decryptedNote.attachments && decryptedNote.attachments.length > 0) {

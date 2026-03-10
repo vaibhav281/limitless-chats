@@ -15,6 +15,8 @@ import CloseIcon from "@mui/icons-material/Close";
 import Webcam from "react-webcam";
 import CameraAltIcon from '@mui/icons-material/CameraAlt';
 import KeyboardArrowDownIcon from '@mui/icons-material/KeyboardArrowDown';
+import axios from 'axios';
+import { blobCache } from '../features/encryption/blobCache';
 import dayjs from "dayjs";
 import isToday from "dayjs/plugin/isToday";
 import isYesterday from "dayjs/plugin/isYesterday";
@@ -285,7 +287,21 @@ export default function DailyNotesPage() {
       const realNoteForSender = {
           ...realNote,
           noteText: textTarget,
-          attachments: optimisticAttachments,
+          attachments: realNote.attachments.map((serverAtt, idx) => {
+              const attachId = serverAtt.attachmentId || serverAtt.fileIndex || idx;
+              const volatileBlobUrl = optimisticAttachments[idx]?.url;
+              
+              if (volatileBlobUrl && volatileBlobUrl.startsWith('blob:')) {
+                  blobCache.set(`${realNote._id}_${attachId}`, volatileBlobUrl);
+              }
+
+              return {
+                  ...serverAtt,
+                  url: serverAtt.url, // Store the stable Server API URL in IndexedDB!
+                  binaryAesKey: optimisticAttachments[idx]?.binaryAesKey,
+                  binaryIv: optimisticAttachments[idx]?.binaryIv
+              };
+          }),
           isDecrypted: true,
           status: 'sent'
       };
