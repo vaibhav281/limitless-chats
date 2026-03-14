@@ -10,6 +10,7 @@ const noteSchema = new mongoose.Schema(
         pinnedAt: { type: Date, default: null },
         attachments: [
             {
+                id: { type: String }, // Canonical content hash (SHA-256)
                 url: { type: String }, // Relative path to file
                 type: { type: String }, // 'image', 'video'
                 originalName: { type: String },

@@ -1,19 +1,15 @@
 import { getMessageLocally, saveMessageLocally } from './localMessageStore';
 import { mediaKeyCache } from './mediaKeyCache';
+import { runMediaDecryptionPipeline, getEffectiveAttachmentId } from './cryptoService';
+import { blobCache } from './blobCache';
 
 // Global map to hold promises for currently processing messages
-// to completely prevent race conditions natively across the entire app
 const processingLocks = new Map();
 
 export const MessageLifecycleManager = {
-    /**
-     * MUST be injected with the `decryptIncoming` function from `useEncryptedMessaging`
-     * until the crypto layer is fully decoupled from the React lifecycle.
-     */
     async processMessage(rawMessage, decryptIncomingFn) {
         if (!rawMessage || !rawMessage._id) return rawMessage;
 
-        // 1. Enforce Per-Message Mutex (Adjustment 1)
         if (processingLocks.has(rawMessage._id)) {
             return processingLocks.get(rawMessage._id);
         }
@@ -29,9 +25,6 @@ export const MessageLifecycleManager = {
         }
     },
 
-    /**
-     * Processes an array of messages incrementally, allowing partial successes (Adjustment 2)
-     */
     async processMessages(rawMessages, decryptIncomingFn) {
         const processed = [];
         for (const msg of rawMessages) {
@@ -40,7 +33,6 @@ export const MessageLifecycleManager = {
                 processed.push(result);
             } catch (err) {
                 console.error(`Failed to process message ${msg._id}:`, err);
-                // Push a failed state so the UI can render an error bubble instead of dropping it entirely
                 processed.push({ ...msg, noteText: "🔐 Decryption error", isDecrypted: false });
             }
         }
@@ -48,38 +40,34 @@ export const MessageLifecycleManager = {
     },
 
     async _internalProcess(rawMessage, decryptIncomingFn) {
-        // If it lacks ciphertext, it's either an error or a system message
         if (!rawMessage.ciphertext) {
             return { ...rawMessage, noteText: rawMessage.noteText || "🔐 Error: Missing ciphertext", isDecrypted: false };
         }
 
-        // If the socket or cache already hydrated the plaintext (e.g. sender's own message), skip crypto!
         if (rawMessage.isDecrypted) {
+            // Even if already marked decrypted (e.g. sender sync), ensure media is hydrated
+            this.scheduleMediaHydration(rawMessage);
             return rawMessage;
         }
 
-        // 1. Check IndexedDB cache first (fast path)
         const local = await getMessageLocally(rawMessage._id);
         if (local) {
+            this.scheduleMediaHydration(local);
             return local;
         }
 
-        // SENDER SOCKET RACE FIX: Prevent Senders from decrypting their own websocket bounce-backs!
         const currentUserId = localStorage.getItem('userId');
         if (rawMessage.senderId === currentUserId) {
-            return {
-                ...rawMessage,
-                noteText: "🔐 Message sent (plaintext not in cache)",
-                isDecrypted: true,
-                permanentlyFailed: true
-            };
+            const decryptedNote = await decryptIncomingFn(rawMessage);
+            if (decryptedNote && decryptedNote.isDecrypted === undefined) {
+                decryptedNote.isDecrypted = true;
+            }
+            this.scheduleMediaHydration(decryptedNote);
+            return decryptedNote;
         }
 
-        // 2. Not cached. Must decrypt via Signal Protocol.
         const decryptedNote = await decryptIncomingFn(rawMessage);
 
-        // OLD RATCHET LOCK: If Signal Protocol catches Bad MAC / Session Desync for an old message,
-        // we permanently mark it as undecryptable and save it to IndexedDB so it never retries on refresh!
         if (decryptedNote.noteText && decryptedNote.noteText.includes("🔐") &&
             (decryptedNote.noteText.includes("Bad MAC") || decryptedNote.noteText.includes("No record for device") || decryptedNote.noteText.includes("Decryption error"))) {
 
@@ -91,30 +79,64 @@ export const MessageLifecycleManager = {
             return decryptedNote;
         }
 
-        // 3. Extract and cache Media Keys (Adjustment 4)
+        // Hydrate media immediately before scrubbing keys (or use the binary keys directly)
+        this.scheduleMediaHydration(decryptedNote);
+
         if (decryptedNote.isDecrypted && decryptedNote.attachments && decryptedNote.attachments.length > 0) {
             for (const [idx, att] of decryptedNote.attachments.entries()) {
                 if (att.binaryAesKey) {
-                    const attachIndex = att.fileIndex !== undefined ? att.fileIndex : idx;
-                    await mediaKeyCache.saveMediaKey(rawMessage.receiverId, rawMessage._id, attachIndex, {
-                        aesKey: att.binaryAesKey
-                    });
-
-                    // Make sure we clear binaryAesKey from the message object before caching plaintext 
-                    // to maintain strict separation of concerns (Storage Layer Rule)
-                    // UI components should always hit the `mediaKeyCache`
                     delete att.binaryAesKey;
                     delete att.binaryIv;
                 }
             }
         }
 
-        // 4. Cache Plaintext Message ONLY (Adjustment 4)
         if (decryptedNote.isDecrypted) {
             await saveMessageLocally(decryptedNote);
         }
 
-        // 5. Return to UI (Adjustment 5)
         return decryptedNote;
+    },
+
+    /**
+     * Non-blocking background hydration of all media in a message.
+     * Uses microtasks to ensure UI responsiveness.
+     */
+    scheduleMediaHydration(note) {
+        if (!note.attachments || note.attachments.length === 0) return;
+
+        // Use queueMicrotask to defer decryption until after the current processing batch
+        queueMicrotask(async () => {
+            const userId = localStorage.getItem('userId');
+
+            for (const att of note.attachments) {
+                const effectiveId = getEffectiveAttachmentId(att);
+                const cacheKey = `${note._id}_${effectiveId}`;
+
+                // Skip if already in memory cache
+                if (blobCache.has(cacheKey)) continue;
+
+                try {
+                    // Retrieval: If keys are missing (post-scrub), look them up in IndexedDB
+                    let aesKey = att.binaryAesKey;
+                    let iv = att.binaryIv || att.iv;
+
+                    if (!aesKey) {
+                        const cached = await mediaKeyCache.getMediaKey(userId, note._id, effectiveId);
+                        if (cached) {
+                            aesKey = cached.aesKey || cached.binaryAesKey;
+                            iv = iv || cached.iv;
+                        }
+                    }
+
+                    // Trigger pipeline (deduplicated by mediaDecryptionLocks)
+                    if (att.url && !att.url.startsWith('blob:')) {
+                        runMediaDecryptionPipeline(note._id, att, aesKey, iv).catch(() => { });
+                    }
+                } catch (err) {
+                    console.warn(`[Hydration] Failed for ${note._id}/${effectiveId}`, err);
+                }
+            }
+        });
     }
 };

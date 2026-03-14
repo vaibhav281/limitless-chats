@@ -46,11 +46,15 @@ router.post("/", (req, res, next) => {
         }
 
         return {
-          url: `/uploads/${file.filename}`, // Actually stored as ciphertext flat blob
+          id: meta.id, // Canonical content hash
+          fileName: meta.fileName || file.originalname, // The original readable name 
+          url: `/uploads/${file.filename}`, // The server path to the ciphertext blob
           encryptedBlobUrl: `/uploads/${file.filename}`,
           type,
           originalMimeType: meta.originalMimeType || mime,
-          originalName: file.originalname,
+          // CRITICAL FIX: The frontend specifically expects `originalName` to trigger valid downloads
+          // Previously this captured the hash.enc name from multer
+          originalName: meta.fileName || file.originalname,
           size: file.size,
           encryptedKeys: meta.encryptedKeysMap || {},
           iv: meta.iv

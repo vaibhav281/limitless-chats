@@ -41,16 +41,38 @@ export default function useFileUpload() {
         }
     }, []);
 
-    const downloadFile = useCallback(async (url, originalName, encryptionKeys = null) => {
+    const downloadFile = useCallback(async (url, originalName, encryptionKeys = null, noteId = null, attachmentId = null) => {
+        let activeKeys = encryptionKeys;
+
+        // 1. Autonomous Cache Lookup (Hardening)
+        if (!activeKeys && noteId && attachmentId && !url.startsWith('blob:')) {
+            try {
+                const { mediaKeyCache } = await import("../features/encryption/mediaKeyCache");
+                const userId = localStorage.getItem('userId');
+                const cached = await mediaKeyCache.getMediaKey(userId, noteId, attachmentId);
+                if (cached) {
+                    activeKeys = {
+                        aesKey: cached.aesKey || cached.binaryAesKey,
+                        iv: cached.iv,
+                        // mimeType will be resolved from extension or passed
+                    };
+                }
+            } catch (e) {
+                console.warn("[useFileUpload] Autonomous key lookup failed", e);
+            }
+        }
+
         if (url && url.startsWith('blob:')) {
             const a = document.createElement('a');
             a.href = url;
             a.download = originalName || 'download';
+            document.body.appendChild(a); // Required for Firefox/some browsers
             a.click();
+            document.body.removeChild(a);
             return;
         }
 
-        tasksRef.current[url] = { type: 'download', url, originalName, encryptionKeys };
+        tasksRef.current[url] = { type: 'download', url, originalName, encryptionKeys: activeKeys };
         const cancelSource = axios.CancelToken.source();
 
         setFileProgress((prev) => ({
@@ -59,15 +81,15 @@ export default function useFileUpload() {
         }));
 
         try {
-            if (encryptionKeys && encryptionKeys.aesKey && encryptionKeys.iv) {
+            if (activeKeys && activeKeys.aesKey && activeKeys.iv) {
                 // Secure E2EE Download Path
                 const { downloadAndDecryptFileWithProgress } = await import("../services/fileService");
                 await downloadAndDecryptFileWithProgress(
                     url,
                     originalName,
-                    encryptionKeys.aesKey,
-                    encryptionKeys.iv,
-                    encryptionKeys.mimeType,
+                    activeKeys.aesKey,
+                    activeKeys.iv,
+                    activeKeys.mimeType,
                     (progress) => {
                         setFileProgress((prev) => ({
                             ...prev,
@@ -93,6 +115,7 @@ export default function useFileUpload() {
             });
 
         } catch (error) {
+            console.error("[useFileUpload] Download pipeline failed", error);
             if (axios.isCancel(error)) {
                 console.log('Download canceled', error.message);
             }
@@ -101,7 +124,7 @@ export default function useFileUpload() {
                 [url]: { ...prev[url], status: 'failed', cancelSource: null }
             }));
         }
-    }, []);
+    }, [downloadFileWithProgress]);
 
     const cancelTask = useCallback((idOrUrl) => {
         setFileProgress((prev) => {
@@ -127,7 +150,7 @@ export default function useFileUpload() {
         if (task.type === 'upload') {
             return await uploadFiles(idOrUrl, task.formData);
         } else if (task.type === 'download') {
-            return await downloadFile(task.url, task.originalName);
+            return await downloadFile(task.url, task.originalName, task.encryptionKeys);
         }
     }, [uploadFiles, downloadFile]);
 

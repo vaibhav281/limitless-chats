@@ -44,7 +44,9 @@ export const downloadFileWithProgress = async (url, originalName, onProgress, ca
     const link = document.createElement("a");
     link.href = window.URL.createObjectURL(blob);
     link.download = originalName || "download";
+    document.body.appendChild(link);
     link.click();
+    document.body.removeChild(link);
     window.URL.revokeObjectURL(link.href);
 };
 
@@ -83,6 +85,8 @@ export const downloadAndDecryptFileWithProgress = async (url, originalName, aesK
     const link = document.createElement("a");
     link.href = window.URL.createObjectURL(decryptedBlob);
     link.download = originalName || "download";
+    document.body.appendChild(link);
     link.click();
+    document.body.removeChild(link);
     window.URL.revokeObjectURL(link.href);
 };

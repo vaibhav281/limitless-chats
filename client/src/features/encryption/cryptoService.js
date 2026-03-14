@@ -1,33 +1,70 @@
 import { Buffer } from 'buffer';
+import axios from 'axios';
+import { persistentBlobStore } from './persistentBlobStore';
+import { blobCache } from './blobCache';
 
-// AES-GCM for File Encryption (not handled by libsignal which is for text)
-export const encryptFile = async (file) => {
+// Global Deduplication Lock Registry for Media Decryption
+// Ensures that multiple UI components requesting the same media only trigger ONE pipeline execution.
+const mediaDecryptionLocks = new Map();
+const usedIVs = new Set(); // Session-level IV reuse guard
+
+// Production-Grade E2EE Error Codes
+export const E2EE_ERRORS = {
+    DECRYPT_PENDING: "ERR_DECRYPT_PENDING",     // Waiting for Signal ratchet
+    SIGNAL_DESYNC: "ERR_SIGNAL_DESYNC",         // MAC failure / Session lost
+    MEDIA_KEY_MISSING: "ERR_MEDIA_KEY_MISSING", // AES key not found in cache
+    MEDIA_DECRYPT_FAIL: "ERR_MEDIA_DECRYPT_FAIL", // AES-GCM decryption failed
+    MEDIA_NOT_FOUND: "ERR_MEDIA_NOT_FOUND",     // 404 from server
+    MEDIA_TIMEOUT: "ERR_MEDIA_TIMEOUT",         // Network timeout
+    CACHE_CORRUPT: "ERR_CACHE_CORRUPT",         // IndexedDB error
+    HASH_MISMATCH: "ERR_HASH_MISMATCH"          // Integrity failure
+};
+
+/**
+ * Computes SHA-256 hash of a buffer to use as a canonical attachment ID.
+ * This ensures stability across refreshes and devices.
+ */
+export async function computeAttachmentHash(buffer) {
+    const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * Encrypts a file using AES-GCM 256
+ */
+export async function encryptFile(file) {
     const arrayBuffer = await file.arrayBuffer();
-    const key = await window.crypto.subtle.generateKey(
+    const aesKey = await crypto.subtle.generateKey(
         { name: "AES-GCM", length: 256 },
         true,
         ["encrypt", "decrypt"]
     );
-    const iv = window.crypto.getRandomValues(new Uint8Array(12));
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ivBase64 = uint8ToBase64(iv);
 
-    const ciphertextBuffer = await window.crypto.subtle.encrypt(
+    // IV Reuse Guard: Ensure key (freshly generated) + IV pair never repeats in this session
+    if (usedIVs.has(ivBase64)) {
+        throw new Error("Critical Security Error: IV reuse detected in encryption pipeline.");
+    }
+    usedIVs.add(ivBase64);
+
+    const ciphertext = await crypto.subtle.encrypt(
         { name: "AES-GCM", iv: iv },
-        key,
+        aesKey, // Use aesKey here
         arrayBuffer
     );
 
-    const exportedKey = await window.crypto.subtle.exportKey("raw", key);
-
-    // Convert ArrayBuffers to Base64 using robust Node Buffer to avoid Latin1 corruption
-    const keyBase64 = uint8ToBase64(new Uint8Array(exportedKey));
-    const ivBase64 = uint8ToBase64(iv);
+    const keyRaw = await crypto.subtle.exportKey("raw", aesKey);
+    const keyBase64 = uint8ToBase64(new Uint8Array(keyRaw));
 
     return {
-        ciphertextBlob: new Blob([ciphertextBuffer], { type: file.type || "application/octet-stream" }),
+        ciphertextBlob: new Blob([ciphertext]),
+        ciphertextBuffer: new Uint8Array(ciphertext),
         keyBase64,
         ivBase64
     };
-};
+}
 
 export const decryptFile = async (ciphertextBlob, aesKeyInput, ivInput, originalMimeType) => {
     const arrayBuffer = ciphertextBlob instanceof ArrayBuffer ? ciphertextBlob : await ciphertextBlob.arrayBuffer();
@@ -65,6 +102,116 @@ export const decryptFile = async (ciphertextBlob, aesKeyInput, ivInput, original
     );
 
     return new Blob([plaintextBuffer], { type: originalMimeType });
+};
+
+/**
+ * Resolves a stable ID for an attachment. 
+ * PRIORITIES: 
+ * 1. Canonical 'id' (SHA-256 Content Hash)
+ * 2. Attachment UUID ('attachmentId')
+ * 3. File Index ('fileIndex')
+ * 4. FALLBACK: originalName
+ */
+export function getEffectiveAttachmentId(attachment, indexFallback = 0) {
+    if (!attachment) return `unknown_${indexFallback}`;
+
+    // 1. Canonical Content Hash (The Gold Standard)
+    if (attachment.id) return attachment.id;
+
+    // 2. Client-generated UUID (Wait until Phase 3 migration finishes)
+    if (attachment.attachmentId) return attachment.attachmentId;
+
+    // 3. File Index (from Signal, for attachments in a message)
+    if (attachment.fileIndex !== undefined) return attachment.fileIndex;
+    if (attachment.index !== undefined) return attachment.index; // Legacy/fallback index
+
+    // 4. Fallback to original name (least stable)
+    if (attachment.originalName) return attachment.originalName;
+
+    return `unknown_${indexFallback}`;
+}
+
+/**
+ * Production-Grade Media Decryption Pipeline.
+ * 1. Deduplicates requests via a promise registry (Mutex).
+ * 2. Checks caches (LRU then Persistent).
+ * 3. Fetches, decrypts, and persists results.
+ * 4. Returns a usable Object URL.
+ */
+export const runMediaDecryptionPipeline = async (noteId, attachment, aesKey, iv) => {
+    const attachmentId = getEffectiveAttachmentId(attachment, attachment.index);
+    const cacheKey = `${noteId}_${attachmentId}`;
+
+    // 1. Enforce Deduplication Lock (Mutex)
+    if (mediaDecryptionLocks.has(cacheKey)) {
+        console.log(`[cryptoService] Awaiting existing pipeline for ${cacheKey}`);
+        return mediaDecryptionLocks.get(cacheKey);
+    }
+
+    const pipelinePromise = (async () => {
+        try {
+            // 2. Check LRU Cache (RAM)
+            const cachedUrl = blobCache.get(cacheKey);
+            if (cachedUrl) return cachedUrl;
+
+            // 3. Sender Preview / Plaintext Bypass
+            // If the URL is already a local blob, it's plaintext. Skip pipeline!
+            if (attachment.url && attachment.url.startsWith('blob:')) {
+                return attachment.url;
+            }
+
+            const resolvedMimeType = attachment.originalMimeType ||
+                (attachment.originalName?.toLowerCase().endsWith('.svg') ? 'image/svg+xml' :
+                    (attachment.type === "image" ? "image/jpeg" : "application/octet-stream"));
+
+            // 4. Check Persistent Store (IndexedDB)
+            const cachedBlob = await persistentBlobStore.getMedia(noteId, attachmentId, resolvedMimeType);
+            if (cachedBlob) {
+                const url = URL.createObjectURL(cachedBlob);
+                blobCache.set(cacheKey, url);
+                return url;
+            }
+
+            // 5. Material Guard
+            // If we are missing keys/URL, we return null gracefully. 
+            // The UI will show a loading/error state until next hydration.
+            if (!aesKey || !iv || !attachment.url) {
+                return null;
+            }
+
+            console.log(`[cryptoService] Starting network pipeline for ${attachment.originalName}`);
+            const response = await axios.get(attachment.url, { responseType: 'arraybuffer' });
+
+            const decryptedBlob = await decryptFile(
+                response.data,
+                aesKey,
+                iv,
+                resolvedMimeType
+            );
+
+            // 5. Persist to IndexedDB immediately (Hardening Step)
+            await persistentBlobStore.saveMedia(noteId, attachmentId, decryptedBlob);
+
+            // 6. Push to LRU and Return URL
+            const finalUrl = URL.createObjectURL(decryptedBlob);
+            blobCache.set(cacheKey, finalUrl);
+
+            return finalUrl;
+
+        } catch (err) {
+            console.error(`[cryptoService] Pipeline failed for ${cacheKey}:`, err);
+            throw err;
+        }
+    })();
+
+    mediaDecryptionLocks.set(cacheKey, pipelinePromise);
+
+    try {
+        return await pipelinePromise;
+    } finally {
+        // Clear the lock so future requests (post-cache-eviction) can re-run
+        mediaDecryptionLocks.delete(cacheKey);
+    }
 };
 
 // Utils

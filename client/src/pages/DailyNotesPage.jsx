@@ -28,7 +28,11 @@ import ChatHeader from "../features/chat/components/ChatHeader";
 import ChatInput from "../features/chat/components/ChatInput";
 import MessageBubble from "../features/chat/components/MessageBubble";
 import PreviewModal from "../features/chat/components/PreviewModal";
+import ErrorBoundary from "../components/common/ErrorBoundary";
 import { markReadAPI } from '../services/api';
+import config from "../../../shared/constants/supportedFileTypes.json";
+const { ALLOWED_MIME_TYPES, MAX_FILE_SIZE, SUPPORTED_EXTENSIONS } = config;
+const ALL_SUPPORTED_EXTENSIONS = Object.values(SUPPORTED_EXTENSIONS).flat();
 
 export default function DailyNotesPage() {
   const inputRef = useRef();
@@ -158,18 +162,25 @@ export default function DailyNotesPage() {
     const files = Array.from(e.target.files);
     if (!files.length) return;
 
-    const SUPPORTED_FILE_TYPES = [
-      "image/jpeg", "image/png", "image/jpg", "image/webp", "image/gif", "image/svg+xml",
-      "video/mp4", "video/webm", "video/quicktime",
-      "audio/mp3", "audio/mpeg", "audio/wav", "audio/ogg",
-      "application/pdf", "application/msword",
-      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-      "application/vnd.ms-excel",
-      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-      "application/zip", "application/x-zip-compressed", "text/plain"
-    ];
+    const oversizedFiles = files.filter(f => f.size > MAX_FILE_SIZE);
+    if (oversizedFiles.length > 0) {
+        alert(`Some files exceed the 100MB limit: ${oversizedFiles.map(f => f.name).join(', ')}`);
+        e.target.value = null;
+        return;
+    }
 
-    const unsupportedFiles = files.filter(f => !SUPPORTED_FILE_TYPES.includes(f.type) && !f.name.endsWith('.enc'));
+    const unsupportedFiles = files.filter(f => {
+        if (f.name.endsWith('.enc')) return false; // Allow encrypted payload bypass
+        
+        const ext = f.name.split('.').pop().toLowerCase();
+        const hasValidExt = ALL_SUPPORTED_EXTENSIONS.includes(ext);
+        const hasValidMime = ALLOWED_MIME_TYPES.includes(f.type);
+        
+        // Browsers sometimes drop exact MIME types for opus/mkv/heic/csv.
+        // We will accept it if EITHER the explicit MIME is valid OR the extension is explicitly listed in our trusted set.
+        return !(hasValidExt || hasValidMime);
+    });
+
     if (unsupportedFiles.length > 0) {
        alert(`Some files are not supported: ${unsupportedFiles.map(f => f.name).join(', ')}`);
        e.target.value = null;
@@ -242,7 +253,9 @@ export default function DailyNotesPage() {
 
     encryptedFiles.forEach(ef => {
        if(ef.blob) {
-         formData.append('files', ef.blob, ef.originalName);
+         // 2. Prepare FormData with ciphertext blobs
+         const encryptedFileName = `${ef.id || Date.now()}.enc`; // Use ID-based naming with .enc suffix
+         formData.append('files', ef.blob, encryptedFileName);
          
          // Build structured metadata
          let parsedMap = {};
@@ -253,10 +266,13 @@ export default function DailyNotesPage() {
          }
 
          attachmentsMeta.push({
+             id: ef.id,
+             fileName: ef.originalName, // THE HUMAN READABLE NAME
              encryptedKeysMap: parsedMap,
              iv: ef.iv,
              originalMimeType: ef.originalMimeType,
-             type: ef.type
+             type: ef.type,
+             size: ef.size || 0
          });
        } else console.warn("Missing file blob for", ef);
     });
@@ -321,12 +337,19 @@ export default function DailyNotesPage() {
 
       // Backend returned the new Document. The Socket may have already emitted and added it to the array.
       setNotes(prev => {
-         const alreadyExists = prev.some(n => n._id === realNote._id);
-         if (alreadyExists) {
+         const existingNote = prev.find(n => n._id === realNote._id);
+         if (existingNote) {
             // Socket already inserted it. Filter out tempId, and OVERWRITE socket's version with secure local version
+            // CRITICAL FIX: We MUST preserve any 'delivered' or 'seen' status that the Socket received while we were uploading!
             return prev
               .filter(n => n._id !== tempId)
-              .map(n => n._id === realNote._id ? realNoteForSender : n);
+              .map(n => n._id === realNote._id ? { 
+                  ...realNoteForSender,
+                  status: existingNote.status !== 'sent' ? existingNote.status : realNoteForSender.status,
+                  isRead: existingNote.isRead,
+                  deliveredAt: existingNote.deliveredAt,
+                  seenAt: existingNote.seenAt 
+              } : n);
          }
          // Socket hasn't fired yet. Swap the temporary mock with the verified real note.
          return prev.map(n => n._id === tempId ? realNoteForSender : n);
@@ -464,7 +487,7 @@ export default function DailyNotesPage() {
       {/* Main Chat Area */}
       <Box sx={{ flex: 1, display: { xs: chatWithId ? "flex" : "none", sm: "flex" }, flexDirection: "column", position: "relative" }}>
          {chatWithId ? (
-            <>
+            <ErrorBoundary>
               <ChatHeader chatWithId={chatWithId} setChatWithId={setChatWithId} activeUsers={activeUsers} conversations={conversations} />
               
               {/* Action Bar (Replaces Header when selecting messages) */}
@@ -500,18 +523,12 @@ export default function DailyNotesPage() {
                   <Box sx={{ display: 'flex', flexDirection: 'column-reverse', gap: 1 }}>
                     <div ref={messagesEndRef} />
                     {notes.map((note, index) => {
-                      // Because array is [Newest, ..., Oldest] and container is column-reverse:
-                      // DOM end = Visual top.
-                      // We want date separator visually ABOVE the oldest message of that day.
-                      // This means in the DOM, the separator must come AFTER the oldest message of that day.
-                      // So we check if the NEXT note in the array (which is older) has a DIFFERENT date.
-                      // If it does, we append a separator after rendering this current note.
+                      // Date separator logic remains same...
                       const currentDay = dayjs(note.timestamp).startOf('day');
                       const olderNote = notes[index + 1];
                       let showDateSeparator = false;
                       
                       if (!olderNote) {
-                        // This is the absolute oldest message in the array, it gets a separator above it
                         showDateSeparator = true;
                       } else {
                         const olderDay = dayjs(olderNote.timestamp).startOf('day');
@@ -539,7 +556,6 @@ export default function DailyNotesPage() {
                             </Box>
                           )}
                           
-                          {/* WhatsApp Style Unread Separator */}
                           {isFirstUnread && (
                             <Box 
                               ref={firstUnreadRef} 
@@ -627,8 +643,7 @@ export default function DailyNotesPage() {
                    </Button>
                 </Box>
               </Dialog>
-
-            </>
+            </ErrorBoundary>
          ) : (
             <Box sx={{ flex: 1, display: "flex", justifyContent: "center", alignItems: "center", flexDirection: "column", bgcolor: "#202c33", borderBottom: "6px solid #00a884" }}>
                 <img src="/chat_app.svg" alt="Limitless Chats Logo" style={{ width: 140, height: 140, marginBottom: 24, opacity: 0.9 }} />
@@ -684,14 +699,53 @@ export default function DailyNotesPage() {
                ) : (
                   <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2 }}>
                      <Typography sx={{ color: '#fff' }}>Preview not available for this file type.</Typography>
-                     <Button variant="contained" href={viewingMedia?.items[viewingMedia.currentIndex]?.url} download={viewingMedia?.items[viewingMedia.currentIndex]?.originalName}>Download File</Button>
                   </Box>
                )}
+            </Box>
+
+            {/* Decrypted Download Action Bar */}
+            <Box sx={{ p: 2, display: 'flex', justifyContent: 'center', bgcolor: "rgba(0,0,0,0.5)" }}>
+               <Button 
+                  variant="contained" 
+                  sx={{ bgcolor: "#00a884", '&:hover': { bgcolor: "#008f6f" } }}
+                  onClick={async () => {
+                     const item = viewingMedia.items[viewingMedia.currentIndex];
+                     try {
+                        const blob = await downloadFile(item.url, item.originalName, item.binaryAesKey ? { 
+                           aesKey: item.binaryAesKey, 
+                           iv: item.binaryIv, 
+                           mimeType: item.originalMimeType 
+                        } : null);
+                        
+                        if (blob && blob instanceof Blob) {
+                           const downloadUrl = URL.createObjectURL(blob);
+                           const a = document.createElement("a");
+                           a.href = downloadUrl;
+                           a.download = item.originalName || "download";
+                           document.body.appendChild(a);
+                           a.click();
+                           document.body.removeChild(a);
+                           setTimeout(() => URL.revokeObjectURL(downloadUrl), 100);
+                        }
+                     } catch (err) {
+                        console.error("Manual Download Failed", err);
+                        alert("Could not decrypt file for download.");
+                     }
+                  }}
+               >
+                  Download File
+               </Button>
             </Box>
             
             {/* Multiple media thumbnails carousel */}
             {viewingMedia?.items?.length > 1 && (
-               <Box sx={{ p: 2, display: "flex", gap: 2, overflowX: "auto", justifyContent: "center", bgcolor: "rgba(0,0,0,0.5)" }}>
+               <Box sx={{ 
+                   p: 2, display: "flex", gap: 2, overflowX: "auto", 
+                   justifyContent: "flex-start", bgcolor: "rgba(0,0,0,0.5)", width: "100%",
+                   '&::-webkit-scrollbar': { height: 8 },
+                   '&::-webkit-scrollbar-thumb': { bgcolor: '#8696a0', borderRadius: 4, cursor: 'pointer' },
+                   '&::-webkit-scrollbar-track': { bgcolor: 'rgba(255,255,255,0.05)', borderRadius: 4 }
+               }}>
                  {viewingMedia.items.map((item, idx) => (
                     <Box 
                       key={idx} 

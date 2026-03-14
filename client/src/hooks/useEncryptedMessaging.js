@@ -2,7 +2,7 @@ import { useState, useCallback, useEffect } from 'react';
 import { generateAndUploadKeys, clearLocalKeys } from '../features/encryption/keyManager';
 import { encryptMessage } from '../features/encryption/messageEncryptor';
 import { decryptMessage } from '../features/encryption/messageDecryptor';
-import { encryptFile, decryptFile, uint8ToBase64, base64ToUint8, ensureUint8Array } from '../features/encryption/cryptoService';
+import { encryptFile, decryptFile, uint8ToBase64, base64ToUint8, ensureUint8Array, getEffectiveAttachmentId, computeAttachmentHash } from '../features/encryption/cryptoService';
 import { mediaKeyCache } from '../features/encryption/mediaKeyCache';
 import { signalStore } from '../features/encryption/keyManager';
 import { ensureSession } from '../features/encryption/sessionManager';
@@ -37,16 +37,14 @@ export default function useEncryptedMessaging(userId) {
             const encryptedFiles = [];
             for (const fileObj of plainFiles) {
                 // 1. Encrypt File with random AES-GCM Key
-                const { ciphertextBlob, keyBase64, ivBase64 } = await encryptFile(fileObj.file);
+                const { ciphertextBlob, ciphertextBuffer, keyBase64, ivBase64 } = await encryptFile(fileObj.file);
 
                 const encryptedKeysMap = {};
 
-                // Use a stable UUID instead of a volatile array index (Adjustment for Phase 1)
-                const attachmentId = typeof crypto !== 'undefined' && crypto.randomUUID
-                    ? crypto.randomUUID()
-                    : Date.now().toString(36) + Math.random().toString(36).slice(2);
+                // 2. Compute canonical ID from ciphertext hash (SHA-256)
+                const canonicalId = await computeAttachmentHash(ciphertextBuffer);
 
-                // 2. Encrypt the *AES Key* itself via Signal Double Ratchet for the receiver
+                // 3. Encrypt the *AES Key* itself via Signal Double Ratchet for the receiver
                 if (receiverId !== 'global_group') {
                     try {
                         const encryptedKeyPayloadReceiver = await encryptMessage(receiverId, keyBase64);
@@ -63,14 +61,15 @@ export default function useEncryptedMessaging(userId) {
                 // the AES keys directly into indexedDB `mediaKeyCache` during the `addNote` UI step!
 
                 encryptedFiles.push({
-                    // Supply stable attachmentId into the persistent payload mapping!
-                    attachmentId: attachmentId,
+                    id: canonicalId, // Canonical content hash ID
+                    attachmentId: canonicalId, // Sync both for compatibility
                     blob: ciphertextBlob,
                     encryptedKeysMap: JSON.stringify(encryptedKeysMap), // Send as stringified map
                     iv: ivBase64,
-                    originalName: fileObj.origName || fileObj.originalName,
+                    originalName: fileObj.origName || fileObj.originalName || fileObj.file.name,
                     type: fileObj.type,
                     originalMimeType: fileObj.file.type,
+                    size: fileObj.file?.size || 0,
                     // Strictly parse into proper typed Arrays for immediate Sender Optimistic Cache!
                     binaryAesKey: ensureUint8Array(base64ToUint8(keyBase64)),
                     binaryIv: ensureUint8Array(base64ToUint8(ivBase64))
@@ -82,14 +81,6 @@ export default function useEncryptedMessaging(userId) {
                 type: encryptedTextPayload.type,
                 encryptedFiles
             };
-
-            // 4. Cache OUTGOING message details immediately for refresh resilience
-            // We give it a temporary ID or wait for the server? 
-            // Actually, we usually get the server ID after sending. 
-            // However, we can use the result but we need the note._id.
-            // Since we don't have the final message ID yet, we'll rely on the receiver side
-            // OR if the socket-reply includes the ID, we cache IT then.
-            // For now, let's ensure decryptIncoming is bulletproof for sent messages.
 
             return result;
         } catch (err) {
@@ -190,7 +181,7 @@ export default function useEncryptedMessaging(userId) {
                         let binaryAesKey = null;
 
                         // Use explicit attachmentId if it exists (new UUID standard), fallback to fileIndex or array position 'i' (legacy)
-                        const effectiveId = attachment.attachmentId || (attachment.fileIndex !== undefined ? attachment.fileIndex : i);
+                        const effectiveId = getEffectiveAttachmentId(attachment, i);
 
                         // Lookup this specific attachment in the persistent cache by deterministic ID
                         const cachedAttachment = await mediaKeyCache.getMediaKey(userId, note._id, effectiveId);
