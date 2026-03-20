@@ -1,0 +1,28 @@
+:root {
+  --chat-bg: #0b141a;
+  --msg-in-bg: #202c33;
+  --msg-out-bg: #005c4b;
+
+  --text-primary: #e9edef;
+  --text-secondary: #8696a0;
+
+  --accent: #00a884;
+
+  --bubble-radius: 12px;
+  --bubble-padding-x: 10px;
+  --bubble-padding-y: 6px;
+
+  --gap-xs: 2px;
+  --gap-sm: 4px;
+  --gap-md: 8px;
+}
+
+/* Future Dark/Light toggle ready */
+[data-theme="light"] {
+  --chat-bg: #efeae2;
+  --msg-in-bg: #ffffff;
+  --msg-out-bg: #d9fdd3;
+
+  --text-primary: #111;
+  --text-secondary: #667781;
+}

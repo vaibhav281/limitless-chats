@@ -1,5 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { Box, Paper, Typography, IconButton, Button, CircularProgress } from '@mui/material';
+import '../styles/chat-theme.css';
+import '../styles/message-bubble.css';
 import FileDownloadIcon from '@mui/icons-material/FileDownload';
 import PlayCircleIcon from '@mui/icons-material/PlayCircle';
 import PushPinIcon from '@mui/icons-material/PushPin';
@@ -7,6 +9,9 @@ import ReplyIcon from '@mui/icons-material/Reply';
 import InsertDriveFileIcon from '@mui/icons-material/InsertDriveFile';
 import AudioFileIcon from '@mui/icons-material/AudioFile';
 import PictureAsPdfIcon from '@mui/icons-material/PictureAsPdf';
+import DescriptionIcon from '@mui/icons-material/Description';
+import FolderZipIcon from '@mui/icons-material/FolderZip';
+import GridOnIcon from '@mui/icons-material/GridOn';
 import ContentCopyIcon from '@mui/icons-material/ContentCopy';
 import CancelIcon from '@mui/icons-material/Cancel';
 import ErrorOutlineIcon from '@mui/icons-material/ErrorOutline';
@@ -18,9 +23,11 @@ import { getUserColor } from '../../../utils/getUserColor';
 import { parseMessageText } from '../../../utils/messageParser';
 import DecryptedMedia from './DecryptedMedia';
 import { blobCache } from '../../encryption/blobCache';
-import { getEffectiveAttachmentId, runMediaDecryptionPipeline, E2EE_ERRORS } from '../../encryption/cryptoService';
+import { getEffectiveAttachmentId, runMediaDecryptionPipeline, E2EE_ERRORS, safeUnboxCachedUrl, getBlobCacheKey } from '../../encryption/cryptoService';
 import { mediaKeyCache } from '../../encryption/mediaKeyCache';
 import { classifyFile, FILE_TYPES } from '../utils/fileTypeClassifier';
+import { normalizeAttachments } from '../../../../../shared/utils/normalizeAttachments';
+import { resolveMessageFSM } from '../../../utils/messageStateResolver';
 
 // Error messages mapping (Technical code -> User friendly)
 const ERROR_MAP = {
@@ -33,6 +40,7 @@ const ERROR_MAP = {
 
 const MessageBubble = React.forwardRef(({ 
   note, 
+  allNotes = [],
   userId, 
   onLongPress, 
   onSwipeRight, 
@@ -44,7 +52,8 @@ const MessageBubble = React.forwardRef(({
   cancelTask,
   retryTask,
   currentUser,
-  onRightClick
+  onRightClick,
+  isPinned
 }, ref) => {
   const [touchStart, setTouchStart] = useState(null);
   const [touchTimer, setTouchTimer] = useState(null);
@@ -78,18 +87,40 @@ const MessageBubble = React.forwardRef(({
     return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
   };
 
-  const isLong = note.noteText && note.noteText.length > 300;
-  const displayText = (isLong && !showFull) ? note.noteText.substring(0,300)+"..." : note.noteText;
+  // 🔴 RULE 10: RENDER LOCK — Never render edited message until decryption is complete
+  let finalText;
+  if (note.isEdited) {
+    if (note.isEditReady) {
+      finalText = note.plaintextEdit || "";
+    } else {
+      // Keep previous stable text until decryption resolves
+      finalText = note.plaintextEdit || note.noteText || "";
+    }
+  } else {
+    finalText = note.noteText;
+  }
+  const isLong = finalText && finalText.length > 300;
+  const displayText = (isLong && !showFull) ? finalText.substring(0,300)+"..." : finalText;
+
+  // FIX: Dynamic Reply Resolution (WhatsApp behavior)
+  const repliedMessage = note.replyTo ? allNotes.find(n => n._id === (note.replyTo._id || note.replyTo)) : null;
+  const reply = repliedMessage
+    ? {
+        senderLabel: repliedMessage.senderId === userId ? "You" : (repliedMessage.senderName || repliedMessage.sender || "Unknown"),
+        text: repliedMessage.isDeletedForEveryone ? "This message was deleted" : (repliedMessage.isEdited ? (repliedMessage.plaintextEdit || "") : (repliedMessage.noteText || "🔐"))
+      }
+    : null;
 
   // Hydration is now handled by MessageLifecycleManager. Background triggers removed from UI.
 
   const handleMediaClick = async (e, idx) => {
     e.stopPropagation();
     
-    const itemsWithDecryptedUrls = await Promise.all(note.attachments.map(async (att) => {
+    const itemsWithDecryptedUrls = await Promise.all(note.attachments.map(async (att, idx) => {
         const effectiveId = getEffectiveAttachmentId(att);
-        const cacheKey = `${note._id}_${effectiveId}`;
-        const cachedUrl = blobCache.get(cacheKey);
+        const cacheKey = getBlobCacheKey(note._id, att, idx);
+        const boxed = safeUnboxCachedUrl(blobCache.get(cacheKey));
+        const cachedUrl = boxed ? boxed.url : null;
 
         const currentUserId = localStorage.getItem('userId');
         const cachedMediaKey = await mediaKeyCache.getMediaKey(currentUserId, note._id, effectiveId);
@@ -111,7 +142,7 @@ const MessageBubble = React.forwardRef(({
   // Sub-Renderers
   // -----------------------------------------
 
-  const TextRenderer = () => {
+  const renderText = () => {
     const hasMedia = note.attachments && note.attachments.length > 0;
     const isDecrypted = note.isDecrypted;
     
@@ -126,6 +157,15 @@ const MessageBubble = React.forwardRef(({
             <Typography variant="body1" sx={{ whiteSpace:"pre-wrap", wordBreak:"break-word", fontSize: "0.95rem", color: "#e9edef", flex: 1, pr: 1 }}>
                 {parseMessageText(displayText, currentUser?.username)}
                 {isLong && <Button onClick={e=>{e.stopPropagation(); setShowFull(!showFull);}} sx={{ ml:0, p:0, minWidth:0, fontSize:"0.75rem", textTransform:"none", color:"#53bdeb" }}>{showFull?"Read less":"Read more"}</Button>}
+            </Typography>
+        );
+    }
+
+    // 3. SUCCESS: Message was deleted
+    if (note.isDeletedForEveryone) {
+        return (
+            <Typography variant="body1" sx={{ fontStyle: "italic", color: "#8696a0", fontSize: "0.95rem" }}>
+                This message was deleted
             </Typography>
         );
     }
@@ -164,152 +204,253 @@ const MessageBubble = React.forwardRef(({
     return null;
   };
 
-  const MediaRenderer = ({ items }) => {
+  const renderMediaGrid = (items, isFirst) => {
     if (!items.length) return null;
     const extraCount = Math.max(0, items.length - 4);
     const displayItems = items.slice(0, 4);
-    const isSingle = displayItems.length === 1 && !note.noteText;
+    const isSingle = displayItems.length === 1;
+    const count = displayItems.length;
+
+    // WhatsApp-style grid: 1 = full width, 2 = side by side, 3 = 1 top + 2 bottom, 4 = 2x2
+    const getGridTemplate = () => {
+      if (isSingle) return { columns: '1fr', rows: 'auto' };
+      if (count === 2) return { columns: '1fr 1fr', rows: 'auto' };
+      if (count === 3) return { columns: '1fr 1fr', rows: 'auto auto' };
+      return { columns: '1fr 1fr', rows: '1fr 1fr' }; // 4 items = 2x2
+    };
+
+    const grid = getGridTemplate();
 
     return (
-        <Box sx={{ 
-            display: "grid", 
-            gap: 0.5, 
-            mb: (displayText || note.ciphertext) ? 1 : 0,
-            gridTemplateColumns: isSingle ? '1fr' : 'repeat(2, 1fr)',
-            width: '100%',
-            maxWidth: '320px', // Strict limit to prevent giant image/video bubbles
+        <Box key="media-grid" className="msg-media" style={{ 
+            gridTemplateColumns: grid.columns,
+            gridTemplateRows: grid.rows
         }}>
             {displayItems.map((att, idx) => {
-                const originalIdx = note.attachments.indexOf(att);
-                const isThreeGridFirst = displayItems.length === 3 && idx === 0;
+                try {
+                    const originalIdx = note.attachments.indexOf(att);
+                    // For 3 items: first item spans full width
+                    const spanFull = count === 3 && idx === 0;
 
-                return (
-                    <Box 
-                        key={att.id || `media-${idx}`}
-                        sx={{ 
-                            position: "relative", 
-                            cursor: "pointer", 
-                            borderRadius: 2, 
-                            overflow: "hidden", 
-                            bgcolor: "rgba(0,0,0,0.1)",
-                            gridColumn: isThreeGridFirst ? 'span 2' : 'span 1',
-                            aspectRatio: isSingle ? (att.type === 'video' || classifyFile(att) === FILE_TYPES.VIDEO ? '16 / 9' : 'auto') : (isThreeGridFirst ? '2 / 1' : '1 / 1'),
-                            maxHeight: isSingle ? 400 : 'none',
-                            minHeight: isSingle && (att.type === 'video' || classifyFile(att) === FILE_TYPES.VIDEO) ? 180 : 'auto',
-                        }} 
-                        onClick={(e) => handleMediaClick(e, originalIdx)}
-                    >
-                        <DecryptedMedia 
-                            attachment={att} 
-                            noteId={note._id}
-                            remoteUserId={remoteUserId}
-                            isSentByMe={isSentByMe}
-                            isSingle={isSingle}
-                            isThreeGridFirst={isThreeGridFirst}
-                            extraCount={idx === 3 ? extraCount : 0} 
-                            isThumbnail={true}
-                        />
-                        
-                        {/* WhatsApp-Style Floating Download Button for Media */}
-                        {att._isReady && (
-                            <IconButton
-                                size="small"
-                                onClick={(e) => {
-                                    e.stopPropagation();
-                                    downloadFile(att.url, att.fileName || att.originalName, att.binaryAesKey ? { aesKey: att.binaryAesKey, iv: att.binaryIv, mimeType: att.originalMimeType } : null);
-                                }}
-                                sx={{
-                                    position: 'absolute',
-                                    top: 6,
-                                    right: 6,
-                                    bgcolor: 'rgba(0,0,0,0.5)',
-                                    color: '#e9edef',
-                                    opacity: 0,
-                                    transition: 'opacity 0.2s',
-                                    '&:hover': { bgcolor: '#00a884', color: '#fff' },
-                                    '.MuiBox-root:hover &': { opacity: 1 } // Show on parent hover
-                                }}
-                            >
-                                <FileDownloadIcon fontSize="small" />
-                            </IconButton>
-                        )}
-                    </Box>
-                );
+                    return (
+                        <Box 
+                            key={att.id || `media-${idx}`}
+                            sx={{ 
+                                position: "relative", 
+                                cursor: "pointer", 
+                                overflow: "hidden", 
+                                bgcolor: "#0b141a",
+                                aspectRatio: isSingle 
+                                    ? (att.type === 'video' || classifyFile(att) === FILE_TYPES.VIDEO ? '16 / 9' : 'auto') 
+                                    : '1 / 1',
+                                maxHeight: isSingle ? 400 : 200,
+                                minHeight: isSingle && (att.type === 'video' || classifyFile(att) === FILE_TYPES.VIDEO) ? 180 : (isSingle ? 'auto' : 100),
+                                ...(spanFull && { gridColumn: '1 / -1', aspectRatio: '16 / 9', maxHeight: 220 }),
+                                '&:hover': { opacity: 0.92 }
+                            }} 
+                            onClick={(e) => handleMediaClick(e, originalIdx)}
+                        >
+                            <DecryptedMedia 
+                                attachment={att} 
+                                noteId={note._id}
+                                remoteUserId={remoteUserId}
+                                isSentByMe={isSentByMe}
+                                isSingle={isSingle}
+                                isThreeGridFirst={spanFull}
+                                extraCount={idx === displayItems.length - 1 ? extraCount : 0} 
+                                isThumbnail={true}
+                            />
+                            
+                            {/* WhatsApp-Style Floating Download Button for Media */}
+                            {att._isReady && (
+                                <IconButton
+                                    size="small"
+                                    onClick={(e) => {
+                                        e.stopPropagation();
+                                        downloadFile(att.url, att.fileName || att.originalName, att.binaryAesKey ? { aesKey: att.binaryAesKey, iv: att.binaryIv, mimeType: att.mimeType || att.originalMimeType || att.type } : null);
+                                    }}
+                                    sx={{
+                                        position: 'absolute',
+                                        top: 6,
+                                        right: 6,
+                                        bgcolor: 'rgba(0,0,0,0.5)',
+                                        color: '#e9edef',
+                                        opacity: 0,
+                                        transition: 'opacity 0.2s',
+                                        '&:hover': { bgcolor: '#00a884', color: '#fff' },
+                                        '.MuiBox-root:hover &': { opacity: 1 }
+                                    }}
+                                >
+                                    <FileDownloadIcon fontSize="small" />
+                                </IconButton>
+                            )}
+                        </Box>
+                    );
+                } catch (err) {
+                    console.error("Media render failed:", err);
+                    return <Box key={`err-${idx}`} sx={{ p: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', bgcolor: 'rgba(0,0,0,0.2)', color: '#8696a0', fontSize: '12px' }}>⚠️ Media failed</Box>;
+                }
             })}
         </Box>
     );
   };
 
-  const FileRenderer = ({ items }) => {
-    if (!items.length) return null;
+  const renderAudioRow = (att, isFirst) => {
+      return (
+          <Box key={getEffectiveAttachmentId(att, isFirst ? 0 : 1)} sx={{ overflow: 'hidden' }}>
+              <Box className="msg-audio">
+                  <Box sx={{ flex: 1, minWidth: 0, overflow: 'hidden' }}>
+                      <DecryptedMedia 
+                          attachment={att} 
+                          noteId={note._id}
+                          remoteUserId={remoteUserId}
+                          isSentByMe={isSentByMe}
+                          isSingle={true}
+                          isThumbnail={false}
+                      />
+                  </Box>
+                  <IconButton
+                      size="small"
+                      onClick={(e) => {
+                          e.stopPropagation();
+                          downloadFile(att.url, att.fileName || att.originalName, att.binaryAesKey ? { aesKey: att.binaryAesKey, iv: att.binaryIv, mimeType: att.mimeType || att.originalMimeType || att.type } : null);
+                      }}
+                      sx={{ 
+                          color: 'var(--accent)', 
+                          bgcolor: 'rgba(0,168,132,0.12)', 
+                          flexShrink: 0,
+                          width: 36, height: 36,
+                          '&:hover': { bgcolor: 'rgba(0,168,132,0.25)' }
+                      }}
+                  >
+                      <FileDownloadIcon fontSize="small" />
+                  </IconButton>
+              </Box>
+          </Box>
+      );
+  };
 
-    return (
-        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5, mb: (displayText || note.ciphertext) ? 1 : 0 }}>
-            {items.map((att, idx) => {
-                const type = classifyFile(att);
-                const isPdf = type === FILE_TYPES.PDF;
-                
-                return (
-                    <Box 
-                        key={att.id || `file-${idx}`}
-                        sx={{ 
-                            display: "flex", 
-                            alignItems: "center", 
-                            p: 1.5, 
-                            bgcolor: "rgba(255,255,255,0.05)", 
-                            borderRadius: 1, 
-                            border: "1px solid rgba(255,255,255,0.05)", 
-                            cursor: 'pointer',
-                            '&:hover': { bgcolor: "rgba(255,255,255,0.1)" }
-                        }} 
-                        onClick={(e) => {
-                            e.stopPropagation();
-                            downloadFile(att.url, att.fileName || att.originalName, att.binaryAesKey ? { aesKey: att.binaryAesKey, iv: att.binaryIv, mimeType: att.originalMimeType } : null);
-                        }}
-                    >
-                        <Box sx={{ mr: 1.5, display: 'flex' }}>
-                            {isPdf ? <PictureAsPdfIcon sx={{ fontSize: 32, color: "#e53935" }} /> : 
-                             type === FILE_TYPES.AUDIO ? <AudioFileIcon sx={{ fontSize: 32, color: "#aebac1" }} /> : 
-                             <InsertDriveFileIcon sx={{ fontSize: 32, color: "#aebac1" }} />}
-                        </Box>
-                        <Box sx={{ flex: 1, overflow: "hidden" }}>
-                            <Typography variant="body2" noWrap sx={{ fontWeight: 500, color: "#e9edef" }}>
-                                {att.fileName || att.originalName}
-                            </Typography>
-                            <Typography variant="caption" sx={{ color: "#8696a0" }}>
-                                {att.size ? formatBytes(att.size) : ''} • {att.type ? att.type.toUpperCase() : 'FILE'}
-                            </Typography>
-                        </Box>
-                        <IconButton size="small" sx={{ color: "#aebac1" }}>
-                            <FileDownloadIcon fontSize="small" />
-                        </IconButton>
-                    </Box>
-                );
-            })}
-        </Box>
-    );
+  const getFileIcon = (att) => {
+      const str = ((att.type || '') + ' ' + (att.fileName || att.originalName || '')).toLowerCase();
+      if (str.includes("pdf")) return <PictureAsPdfIcon sx={{ fontSize: 28, color: "#fff" }} />;
+      if (str.includes("word") || str.includes("doc")) return <DescriptionIcon sx={{ fontSize: 28, color: "#fff" }} />;
+      if (str.includes("excel") || str.includes("xls")) return <GridOnIcon sx={{ fontSize: 28, color: "#fff" }} />;
+      if (str.includes("zip") || str.includes("rar")) return <FolderZipIcon sx={{ fontSize: 28, color: "#fff" }} />;
+      return <InsertDriveFileIcon sx={{ fontSize: 28, color: "#fff" }} />;
+  };
+
+  const getIconBg = (att) => {
+      const str = ((att.type || '') + ' ' + (att.fileName || att.originalName || '')).toLowerCase();
+      if (str.includes("pdf")) return '#e53935';
+      if (str.includes("word") || str.includes("doc")) return '#42a5f5';
+      if (str.includes("excel") || str.includes("xls")) return '#4caf50';
+      if (str.includes("zip") || str.includes("rar")) return '#ffa726';
+      return '#8696a0';
+  };
+
+  const getFileExt = (att) => {
+      const name = att.fileName || att.originalName || '';
+      const ext = name.split('.').pop();
+      return ext ? ext.toUpperCase() : 'FILE';
+  };
+
+  const renderFileRow = (att, isFirst) => {
+      return (
+          <Box key={att.id || `file-${att.fileName}`} className="msg-file">
+              <Box className="msg-file-info">
+                  <Box sx={{ 
+                      width: 42, height: 42, borderRadius: '50%', 
+                      bgcolor: getIconBg(att), 
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      flexShrink: 0
+                  }}>
+                      {getFileIcon(att)}
+                  </Box>
+                  <Box sx={{ flex: 1, minWidth: 0, overflow: 'hidden' }}>
+                      <Typography variant="body2" noWrap sx={{ fontWeight: 500, color: 'var(--text-primary)', fontSize: '0.875rem', lineHeight: 1.3 }}>
+                          {att.fileName || att.originalName}
+                      </Typography>
+                      <Typography variant="caption" sx={{ color: 'var(--text-secondary)', fontSize: '0.7rem' }}>
+                          {getFileExt(att)} • {att.size ? formatBytes(att.size) : ''}
+                      </Typography>
+                  </Box>
+              </Box>
+              <Box className="msg-file-actions">
+                  <Box 
+                      onClick={(e) => {
+                          e.stopPropagation();
+                          downloadFile(att.url, att.fileName || att.originalName, att.binaryAesKey ? { aesKey: att.binaryAesKey, iv: att.binaryIv, mimeType: att.mimeType || att.originalMimeType || att.type } : null);
+                      }}
+                  >
+                      Open
+                  </Box>
+                  <Box 
+                      onClick={(e) => {
+                          e.stopPropagation();
+                          downloadFile(att.url, att.fileName || att.originalName, att.binaryAesKey ? { aesKey: att.binaryAesKey, iv: att.binaryIv, mimeType: att.mimeType || att.originalMimeType || att.type } : null);
+                      }}
+                  >
+                      Save as...
+                  </Box>
+              </Box>
+          </Box>
+      );
   };
 
   // Optimization: Memoize attachment filtering (Hardening Rule 8)
-  const { mediaAttachments, fileAttachments, audioAttachments } = useMemo(() => {
-    const media = [];
-    const files = [];
-    const audio = [];
-    (note.attachments || []).forEach(a => {
-        const type = classifyFile(a);
-        if (type === FILE_TYPES.IMAGE || type === FILE_TYPES.VIDEO) media.push(a);
-        else if (type === FILE_TYPES.AUDIO) audio.push(a);
-        else files.push(a);
-    });
-    return { mediaAttachments: media, fileAttachments: files, audioAttachments: audio };
+  // Optimization: Memoize attachment filtering using global normalization utility (Hardening Rule 8)
+  const { images, videos, audio, files } = useMemo(() => {
+     return normalizeAttachments(note.attachments);
   }, [note.attachments]);
 
-  if (note.isDeletedForEveryone || note.isDeletedForMe || note.isDeleted) {
+  const mediaAttachments = [...images, ...videos];
+  const audioAttachments = audio;
+  const fileAttachments = files;
+
+  // Unified content array mapping WhatsApp principle (ONE fused stream)
+  const unifiedContent = [
+      ...fileAttachments.map(f => ({ type: 'file', data: f })),
+      ...(mediaAttachments.length ? [{ type: 'media', data: mediaAttachments }] : []),
+      ...audioAttachments.map(a => ({ type: 'audio', data: a }))
+  ];
+
+  const messageState = resolveMessageFSM(note, userId);
+
+  // 🚫 DO NOT RENDER (Private Deletes)
+  if (messageState === 'deleted-local') {
+      return null;
+  }
+
+  // 🪦 DELETED FOR EVERYONE (Tombstone)
+  if (messageState === 'deleted-global') {
       return (
         <Box id={`deleted-${note._id}`} ref={ref} sx={{ display: "flex", justifyContent: bubbleAlignment, width: "100%", boxSizing: "border-box", py: 0.5, px: { xs: 1, sm: 2 } }}>
           <Paper sx={{ p: "6px 8px 8px 10px", maxWidth:{ xs:"85%", sm:"70%" }, bgcolor: bubbleColor, borderRadius: borderRadius, boxShadow: "0 1px 0.5px rgba(0,0,0,0.13)", display: "flex", alignItems: "center", color: "#8696a0", fontStyle: "italic", opacity: 0.8 }}>
             <BlockIcon sx={{ fontSize: 16, mr: 1 }} />
             <Typography variant="body2">This message was deleted</Typography>
+          </Paper>
+        </Box>
+      );
+  }
+
+  // ⏳ WAITING FOR RATCHET
+  if (messageState === 'waiting') {
+      return (
+        <Box id={`waiting-${note._id}`} ref={ref} sx={{ display: "flex", justifyContent: bubbleAlignment, width: "100%", boxSizing: "border-box", py: 0.5, px: { xs: 1, sm: 2 } }}>
+          <Paper sx={{ p: "6px 8px 8px 10px", maxWidth:{ xs:"85%", sm:"70%" }, bgcolor: bubbleColor, borderRadius: borderRadius, boxShadow: "0 1px 0.5px rgba(0,0,0,0.13)", display: "flex", alignItems: "center", color: "#8696a0", fontStyle: "italic", opacity: 0.8 }}>
+            <Typography variant="body2">Waiting for this message. This may take a while.</Typography>
+          </Paper>
+        </Box>
+      );
+  }
+
+  // ⚠️ EMPTY / CORRUPT DATA
+  if (messageState === 'empty') {
+      return (
+        <Box id={`empty-${note._id}`} ref={ref} sx={{ display: "flex", justifyContent: bubbleAlignment, width: "100%", boxSizing: "border-box", py: 0.5, px: { xs: 1, sm: 2 } }}>
+          <Paper sx={{ p: "6px 8px 8px 10px", maxWidth:{ xs:"85%", sm:"70%" }, bgcolor: bubbleColor, borderRadius: borderRadius, boxShadow: "0 1px 0.5px rgba(0,0,0,0.13)", display: "flex", alignItems: "center", color: "#8696a0", fontStyle: "italic", opacity: 0.8 }}>
+            <ErrorOutlineIcon sx={{ fontSize: 16, mr: 1 }} />
+            <Typography variant="body2">Message sent (copy unavailable)</Typography>
           </Paper>
         </Box>
       );
@@ -350,99 +491,94 @@ const MessageBubble = React.forwardRef(({
         </Box>
       )}
 
-      <Paper sx={{
-        p: "6px 8px 8px 10px",
-        maxWidth:{ xs:"85%", sm:"70%" },
-        bgcolor: isSelected ? "rgba(0,168,132,0.6)" : (note.pinned ? "#182229" : bubbleColor),
-        borderRadius: borderRadius,
-        boxShadow: "0 1px 0.5px rgba(0,0,0,0.13)",
-        position:"relative",
-        cursor:"pointer",
-        "&:hover": { boxShadow: "0 1px 2px rgba(0,0,0,0.2)" },
-        ...(isSelected && { border: "1px solid #00a884" }),
-        display: "flex",
-        flexDirection: "column",
-        color: "#e9edef",
-        minWidth: 0,
-        overflowWrap: "anywhere",
-        wordBreak: "break-word"
-      }}>
+      <Paper className={`msg-bubble ${isSentByMe ? 'out' : 'in'} ${isSelected ? 'selected' : ''}`}>
         {/* Sender Name */}
         {!isSentByMe && senderName !== "Anonymous" && note.isGroup && (
-           <Typography variant="caption" sx={{ color: getUserColor(note.senderId), fontWeight: 'bold', display: 'block', mb: 0.5 }}>
+           <Typography variant="caption" sx={{ color: getUserColor(note.senderId), fontWeight: 'bold', display: 'block', mb: 0.5, px: 'var(--bubble-padding-x)', pt: '8px' }}>
               {senderName}
            </Typography>
         )}
 
-        {/* Reply Reference */}
-        {note.replyTo && (
-           <Box sx={{ mb: 0.5, borderLeft: "4px solid #00a884", pl: 1, bgcolor: "rgba(0,0,0,0.2)", borderRadius: 1, py: 0.5, cursor: "pointer" }} onClick={(e) => {
+        {/* Reply Reference (WhatsApp Style) */}
+        {reply && (
+           <Box className="msg-reply" onClick={(e) => {
              e.stopPropagation();
-             const el = document.getElementById(note.replyTo._id);
+             const el = document.getElementById(repliedMessage?._id);
              if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
            }}>
-              <Typography variant="caption" sx={{ color: "#00a884", fontWeight: 700, display: "block" }}>{note.replyTo.senderName || note.replyTo.sender || "Unknown"}</Typography>
-              <Typography variant="caption" noWrap sx={{ color: "#aebac1", display: "block" }}>
-                {note.replyTo.attachments?.length > 0 ? "Photo/Video" : note.replyTo.noteText}
+              <Typography variant="caption" sx={{ color: "var(--accent)", fontWeight: 700, display: "block", fontSize: 12 }}>
+                {reply.senderLabel}
+              </Typography>
+              <Typography variant="caption" noWrap sx={{ color: "var(--text-secondary)", display: "block", fontSize: 12 }}>
+                {repliedMessage?.attachments?.length > 0 ? "Photo/Video" : reply.text}
               </Typography>
            </Box>
         )}
-
-        {note.pinned && (
-           <Box sx={{ display: "flex", alignItems: "center", mb: 0.5, borderLeft: "4px solid #8696a0", pl: 1, bgcolor: "rgba(0,0,0,0.2)", borderRadius: 1, py: 0.5 }}>
-              <PushPinIcon sx={{ fontSize: 12, mr: 0.5, color: "#8696a0" }} />
-              <Typography variant="caption" sx={{ color: "#8696a0", fontWeight: 600 }}>Pinned</Typography>
-           </Box>
+        {/* Message Content Stream (Unified Surface) */}
+        <Box className="msg-content">
+            {unifiedContent.map((item, i) => {
+                const isFirst = i === 0;
+                if (item.type === 'file') return renderFileRow(item.data, isFirst);
+                if (item.type === 'media') return renderMediaGrid(item.data, isFirst);
+                if (item.type === 'audio') return renderAudioRow(item.data, isFirst);
+                return null;
+            })}
+        </Box>
+        
+        {/* Text Content */}
+        {displayText && (
+            <Box className="msg-text">
+                {renderText()}
+            </Box>
         )}
 
-        {/* Message Content */}
-        <Box sx={{ display: 'flex', flexDirection: 'column' }}>
-            {(() => {
-                return (
-                    <>
-                        <MediaRenderer items={mediaAttachments} />
-                        {audioAttachments.map((att, idx) => (
-                            <Box key={att.id || `audio-${idx}`} sx={{ mb: (displayText || note.ciphertext) ? 1 : 0 }}>
-                                <DecryptedMedia 
-                                    attachment={{...att, type: 'audio'}} 
-                                    noteId={note._id}
-                                    remoteUserId={remoteUserId}
-                                    isSentByMe={isSentByMe}
-                                    isSingle={true}
-                                    isThumbnail={false}
-                                />
-                            </Box>
-                        ))}
-                        <FileRenderer items={fileAttachments} />
-                        <TextRenderer />
-                    </>
-                );
-            })()}
-        </Box>
-
         {/* Timestamp & Status */}
-        <Box sx={{ display: "flex", alignItems: "flex-end", justifyContent: "flex-end", mt: 0.5 }}>
+        <Box className="msg-meta">
               <Typography 
                 variant="caption" 
                 sx={{ 
-                  color: isSentByMe ? "rgba(255,255,255,0.7)" : "#8696a0", 
-                  fontSize: "0.65rem", 
                   display: 'flex',
                   alignItems: 'center',
                   gap: 0.5
                 }}
               >
-                {note.isEdited && <span>(edited) </span>}
+                {isPinned && <PushPinIcon sx={{ fontSize: "14px", mr: 0.5, color: "#8696a0" }} />}
+                {note.isEdited && !note.isDeletedForEveryone && (
+                    <Box component="span" sx={{ fontSize: '0.6rem', fontStyle: 'italic', opacity: 0.85, mr: 0.3 }}>edited</Box>
+                )}
                 {dayjs(note.timestamp).format("h:mm A")}
                 {isSentByMe && (
                   <Box component="span" sx={{ display: 'flex', alignItems: 'center', ml: 0.5 }}>
-                    {(note.isRead || note.status === 'seen') ? (
-                       <DoneAllIcon sx={{ fontSize: 14, color: '#53bdeb' }} />
-                    ) : note.status === 'delivered' ? (
-                       <DoneAllIcon sx={{ fontSize: 14, color: '#8696a0' }} />
-                    ) : (
-                       <CheckIcon sx={{ fontSize: 14, color: '#8696a0' }} />
-                    )}
+                    {(() => {
+                        const task = fileProgress && fileProgress[note._id];
+                        const isPending = task && (task.status === 'uploading' || task.status === 'encrypting');
+                        const isFailed = (task && task.status === 'failed') || note.permanentlyFailed;
+
+                        if (isPending) {
+                            return <CircularProgress size={14} sx={{ color: '#8696a0', ml: 0.5 }} />;
+                        }
+                        if (isFailed) {
+                            return (
+                                <IconButton 
+                                    size="small" 
+                                    sx={{ p: 0, ml: 0.5, color: '#f15c6d' }} 
+                                    onClick={(e) => { e.stopPropagation(); if (retryTask) retryTask(note._id); }}
+                                    title="Retry Send"
+                                >
+                                    <ErrorOutlineIcon sx={{ fontSize: 16 }} />
+                                </IconButton>
+                            );
+                        }
+                        
+                        // Normal Done States (task sent or cleared)
+                        if (note.isRead || note.status === 'seen') {
+                           return <DoneAllIcon sx={{ fontSize: 14, color: '#53bdeb' }} />;
+                        }
+                        if (note.status === 'delivered') {
+                           return <DoneAllIcon sx={{ fontSize: 14, color: '#8696a0' }} />;
+                        }
+                        return <CheckIcon sx={{ fontSize: 14, color: '#8696a0' }} />;
+                    })()}
                   </Box>
                 )}
               </Typography>
@@ -452,4 +588,23 @@ const MessageBubble = React.forwardRef(({
   );
 });
 
-export default MessageBubble;
+export default React.memo(MessageBubble, (prevProps, nextProps) => {
+    const isNoteSame = prevProps.note._id === nextProps.note._id && 
+                      prevProps.note.status === nextProps.note.status && 
+                      prevProps.note.isDecrypted === nextProps.note.isDecrypted &&
+                      prevProps.note.isEdited === nextProps.note.isEdited &&
+                      prevProps.note.plaintextEdit === nextProps.note.plaintextEdit &&
+                      prevProps.note.isDeletedForEveryone === nextProps.note.isDeletedForEveryone;
+
+    // We must also re-render if the original message being replied to changes its text!
+    const replyId = nextProps.note.replyTo?._id || nextProps.note.replyTo;
+    let isReplySame = true;
+    if (replyId) {
+        const prevReply = prevProps.allNotes?.find(n => n._id === replyId);
+        const nextReply = nextProps.allNotes?.find(n => n._id === replyId);
+        isReplySame = prevReply?.plaintextEdit === nextReply?.plaintextEdit && 
+                     prevReply?.isDeletedForEveryone === nextReply?.isDeletedForEveryone;
+    }
+
+    return isNoteSame && isReplySame && prevProps.isSelected === nextProps.isSelected;
+});

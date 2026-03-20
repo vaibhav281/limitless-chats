@@ -31,3 +31,10 @@
 * BlurHash preview for encrypted images
 * Chunked encryption for files larger than 100MB
 * IndexedDB blob persistence for offline preview
+
+## Theme System
+* Add Theme Controller (Global Context)
+* Persist theme in localStorage
+* Toggle (dark/light/system)
+* Dynamic CSS variables switch
+* MUI theme sync

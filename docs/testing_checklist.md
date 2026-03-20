@@ -36,3 +36,4 @@ Execute these manual tests to verify the integrity of the file upload, UI render
 - [ ] Upload is immediately rejected by the frontend validation.
 - [ ] If bypassed on the frontend, the backend Multer middleware strictly rejects it.
 - [ ] No malicious payload reaches the E2EE storage array.
+

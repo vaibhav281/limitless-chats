@@ -1,6 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const Note = require("../models/Note");
+const PinnedMessage = require("../models/PinnedMessage");
 
 const upload = require("../middleware/upload");
 
@@ -24,6 +25,32 @@ router.post("/", (req, res, next) => {
     let attachments = [];
 
     if (req.files && req.files.length > 0) {
+      // Security Hook: Magic Number Validation against MIME spoofing
+      let fileTypeFromBuffer;
+      try {
+        const m = await import('file-type');
+        fileTypeFromBuffer = m.fileTypeFromFile || m.fileTypeFromBuffer;
+      } catch (err) {
+        console.warn("Could not load file-type module", err);
+      }
+
+      if (fileTypeFromBuffer) {
+        for (let i = 0; i < req.files.length; i++) {
+          const file = req.files[i];
+          // If the buffer is pure AES noise, fileTypeFromBuffer returns undefined
+          const type = await fileTypeFromBuffer(file.path);
+          const actualMime = type ? type.mime : 'application/octet-stream';
+          const ext = file.originalname.split('.').pop().toLowerCase();
+
+          // Reject malicious payloads hiding behind overrides, but bypass E2EE .enc payloads
+          if (ext !== 'enc' && actualMime !== file.mimetype) {
+            console.error(`[Security] MIME Spoofing detected! Actual: ${actualMime}, Stated: ${file.mimetype}`);
+            req.files.forEach(f => require('fs').unlinkSync(f.path));
+            return res.status(403).json({ message: "Security Violation: File type spoofing detected." });
+          }
+        }
+      }
+
       let metaData = [];
       try {
         metaData = JSON.parse(req.body.attachmentsMeta || "[]");
@@ -259,19 +286,27 @@ router.put("/mark-read", async (req, res) => {
 // Edit a note
 router.put("/:id", async (req, res) => {
   try {
-    const { noteText, userId } = req.body;
+    const { noteText, userId, editType } = req.body;
     let note = await Note.findById(req.params.id);
     if (!note) return res.status(404).json({ error: "Note not found" });
-    if (note.senderId !== userId) return res.status(403).json({ error: "Unauthorized to edit this note" });
+    if (note.senderId.toString() !== userId.toString()) return res.status(403).json({ error: "Unauthorized to edit this note" });
 
     // WhatsApp logic gates:
     if (note.attachments && note.attachments.length > 0) return res.status(400).json({ error: "Cannot edit messages with attachments" });
     if (note.isDeletedForEveryone || (note.deletedForUsers && note.deletedForUsers.includes(userId))) return res.status(400).json({ error: "Cannot edit a deleted message" });
     if (Date.now() - new Date(note.timestamp).getTime() > 900000) return res.status(400).json({ error: "Messages can only be edited within 15 minutes of sending" });
 
-    note.noteText = noteText;
+    // Archive the existing payload before overwriting
+    note.editHistory.push({
+        noteText: note.ciphertextEdit || '',
+        editedAt: note.editedAt || note.timestamp
+    });
+
+    note.ciphertextEdit = noteText;
+    note.editType = editType || 1; // Store Signal type for receiver decryption
     note.isEdited = true;
     note.editedAt = Date.now();
+    note.version = (note.version || 1) + 1; // 🔴 CRITICAL: Increment version authority
     await note.save();
 
     const populatedNote = await Note.findById(note._id).populate("replyTo");
@@ -455,63 +490,49 @@ router.delete("/delete-all", async (req, res) => {
   }
 });
 
-// Pin a note
-router.post("/pin/:id", async (req, res) => {
+// Fetch user pins
+router.get("/pinned/:userId", async (req, res) => {
   try {
-    const note = await Note.findById(req.params.id);
-    if (!note) return res.status(404).json({ error: "Note not found" });
-
-    // Update pinned notes logic
-    let pinnedNotes = await Note.find({ pinned: true }).sort({ pinnedAt: 1 });
-
-    if (pinnedNotes.length >= 3) {
-      // unpin the oldest
-      const oldest = pinnedNotes[0];
-      oldest.pinned = false;
-      oldest.pinnedAt = null;
-      await oldest.save();
-    }
-
-    note.pinned = true;
-    note.pinnedAt = new Date();
-    await note.save();
-
-    const populatedNote = await Note.findById(note._id).populate("replyTo");
-
-    if (req.io) {
-      // Inform clients to update pinned status
-      req.io.emit("noteUpdated", populatedNote);
-      // Also broadcast other notes that might have been unpinned
-      if (typeof oldest !== 'undefined' && oldest) {
-        const oldPopulated = await Note.findById(oldest._id).populate("replyTo");
-        req.io.emit("noteUpdated", oldPopulated);
-      }
-    }
-
-    res.json(populatedNote);
+    const pins = await PinnedMessage.find({ userId: req.params.userId });
+    res.json(pins.map(p => p.messageId));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
+// Pin a note
+router.post("/pin/:id", async (req, res) => {
+  try {
+    const { userId } = req.body;
+    if (!userId) return res.status(400).json({ error: "Missing userId" });
+
+    let userPins = await PinnedMessage.find({ userId }).sort({ pinnedAt: 1 });
+    if (userPins.length >= 3) {
+      // Unpin oldest if at limit
+      await PinnedMessage.findByIdAndDelete(userPins[0]._id);
+    }
+
+    await PinnedMessage.findOneAndUpdate(
+       { userId, messageId: req.params.id },
+       { pinnedAt: new Date() },
+       { upsert: true, new: true }
+    );
+
+    res.json({ success: true, messageId: req.params.id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // Unpin a note
 router.post("/unpin/:id", async (req, res) => {
   try {
-    const note = await Note.findById(req.params.id);
-    if (!note) return res.status(404).json({ error: "Note not found" });
+    const { userId } = req.body;
+    if (!userId) return res.status(400).json({ error: "Missing userId" });
 
-    note.pinned = false;
-    note.pinnedAt = null;
-    await note.save();
+    await PinnedMessage.findOneAndDelete({ userId, messageId: req.params.id });
 
-    const populatedNote = await Note.findById(note._id).populate("replyTo");
-
-    if (req.io) {
-      req.io.emit("noteUpdated", populatedNote);
-    }
-
-    res.json(populatedNote);
+    res.json({ success: true, messageId: req.params.id });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

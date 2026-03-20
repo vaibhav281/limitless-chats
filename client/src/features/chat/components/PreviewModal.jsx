@@ -36,7 +36,7 @@ const PreviewItem = React.memo(({ pf, onRemove }) => {
 
 export default function PreviewModal({ 
   openPreview, 
-  setOpenPreview, 
+  handleClosePreview, 
   previewFiles, 
   handleRemovePreview, 
   fileInputRef,
@@ -46,7 +46,7 @@ export default function PreviewModal({
   isUploading
 }) {
   return (
-    <Dialog open={openPreview} onClose={() => setOpenPreview(false)} fullWidth maxWidth="sm">
+    <Dialog open={openPreview} onClose={handleClosePreview} fullWidth maxWidth="sm">
       <DialogTitle sx={{ pb: 1 }}>Preview</DialogTitle>
       <DialogContent sx={{ p: 2, display: 'flex', flexDirection: 'column', gap: 2 }}>
         <Box sx={{ 
@@ -101,7 +101,7 @@ export default function PreviewModal({
         />
       </DialogContent>
       <DialogActions sx={{ px: 3, pb: 2 }}>
-        <Button onClick={() => setOpenPreview(false)} color="inherit" disabled={isUploading}>Cancel</Button>
+        <Button onClick={handleClosePreview} color="inherit" disabled={isUploading}>Cancel</Button>
         <Button onClick={handleSendAttachments} variant="contained" disabled={isUploading} sx={{ bgcolor: "#00a884", borderRadius: 4, px: 3, "&:hover": {bgcolor: "#008f72"} }}>
           {isUploading ? <CircularProgress size={24} color="inherit" /> : "Send"}
         </Button>

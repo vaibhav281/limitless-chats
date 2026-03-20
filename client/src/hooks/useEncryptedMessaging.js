@@ -168,6 +168,23 @@ export default function useEncryptedMessaging(userId) {
             // Restore the UI format
             const restoredNote = { ...note, noteText: decryptedText, isDecrypted: true };
 
+            // ✅ E2EE Reply Sync: If there is a reply preview, aggressively unpack its decrypted text from cache
+            if (restoredNote.replyTo) {
+                try {
+                    const replyCacheEntry = await mediaKeyCache.getMediaKey(userId, restoredNote.replyTo._id, 'text');
+                    if (replyCacheEntry && replyCacheEntry.decryptedText) {
+                        // The cache might contain the original text OR the edited text depending on what happened last.
+                        // We safely bind it to both fields since MessageBubble uses `plaintextEdit` if `isEdited` is true.
+                        restoredNote.replyTo.noteText = replyCacheEntry.decryptedText;
+                        if (restoredNote.replyTo.isEdited) {
+                             restoredNote.replyTo.plaintextEdit = replyCacheEntry.decryptedText;
+                        }
+                    } else {
+                        restoredNote.replyTo.noteText = "🔐 (Encrypted reply)";
+                    }
+                } catch(e) { console.warn("Failed to unpack reply text", e); }
+            }
+
             // 2. Decrypt Attachments (Strict Signal-Once Policy)
             const newKeysToCache = [];
             const textRatchetFailed = decryptResult && typeof decryptResult === 'object' && decryptResult.error;

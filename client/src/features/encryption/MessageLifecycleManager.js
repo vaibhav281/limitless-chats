@@ -1,7 +1,8 @@
 import { getMessageLocally, saveMessageLocally } from './localMessageStore';
 import { mediaKeyCache } from './mediaKeyCache';
-import { runMediaDecryptionPipeline, getEffectiveAttachmentId } from './cryptoService';
+import { runMediaDecryptionPipeline, getEffectiveAttachmentId, getBlobCacheKey } from './cryptoService';
 import { blobCache } from './blobCache';
+import { decryptMessage } from './messageDecryptor';
 
 // Global map to hold promises for currently processing messages
 const processingLocks = new Map();
@@ -52,6 +53,57 @@ export const MessageLifecycleManager = {
 
         const local = await getMessageLocally(rawMessage._id);
         if (local) {
+            // CRITICAL CACHE FIX: ALWAYS TRUST SERVER FOR MUTATIONS
+            // The local DB has the raw decrypted media/text, but the Server knows if it was deleted/edited.
+            local.isDeletedForEveryone = rawMessage.isDeletedForEveryone || local.isDeletedForEveryone;
+            local.isDeletedForMe = rawMessage.isDeletedForMe || local.isDeletedForMe;
+            local.isDeleted = rawMessage.isDeleted || local.isDeleted;
+            local.deletedForUsers = rawMessage.deletedForUsers || local.deletedForUsers;
+
+            // 🔴 CRITICAL VERSION LOCK: Hydration validation
+            if (rawMessage.isEdited) {
+                const userId = localStorage.getItem('userId');
+                const cached = await mediaKeyCache.getMediaKey(userId, rawMessage._id, "text");
+
+                if (cached && cached.version === rawMessage.version && cached.decryptedText) {
+                    // CACHE IS VALID: Safe to use
+                    local.plaintextEdit = cached.decryptedText;
+                    local.isEditReady = true;
+                } else {
+                    // CACHE IS STALE: Force fresh decryption
+                    // 🔴 BYPASS decryptIncomingFn() — call raw decryptMessage() directly
+                    const encryptedSource = rawMessage.ciphertextEdit;
+                    if (encryptedSource) {
+                        try {
+                            const rawDecrypted = await decryptMessage(
+                                rawMessage.senderId,
+                                rawMessage.editType || 1,
+                                encryptedSource
+                            );
+                            if (rawDecrypted && typeof rawDecrypted === 'string') {
+                                local.plaintextEdit = rawDecrypted;
+                                local.isEditReady = true;
+                                await mediaKeyCache.saveMediaKey(userId, rawMessage._id, "text", {
+                                    decryptedText: rawDecrypted,
+                                    version: rawMessage.version
+                                });
+                            }
+                        } catch (e) {
+                            console.warn("Hydration edit decrypt fail", e);
+                            // Last resort: use stale cache if available
+                            if (cached?.decryptedText) {
+                                local.plaintextEdit = cached.decryptedText;
+                                local.isEditReady = true;
+                            }
+                        }
+                    }
+                }
+
+                local.version = rawMessage.version;
+                local.isEdited = true;
+                local.editedAt = rawMessage.editedAt;
+            }
+
             this.scheduleMediaHydration(local);
             return local;
         }
@@ -79,17 +131,24 @@ export const MessageLifecycleManager = {
             return decryptedNote;
         }
 
-        // Hydrate media immediately before scrubbing keys (or use the binary keys directly)
-        this.scheduleMediaHydration(decryptedNote);
-
+        // CRITICAL: Save keys to IndexedDB BEFORE deleting from object
+        // scheduleMediaHydration runs in a microtask (LATER), so keys would be gone by then
         if (decryptedNote.isDecrypted && decryptedNote.attachments && decryptedNote.attachments.length > 0) {
+            const userId = localStorage.getItem('userId');
             for (const [idx, att] of decryptedNote.attachments.entries()) {
                 if (att.binaryAesKey) {
+                    const effectiveId = getEffectiveAttachmentId(att, idx);
+                    await mediaKeyCache.saveMediaKey(userId, decryptedNote._id, effectiveId, {
+                        aesKey: att.binaryAesKey
+                    });
                     delete att.binaryAesKey;
                     delete att.binaryIv;
                 }
             }
         }
+
+        // Now hydrate media — keys are safely in IndexedDB for the pipeline to find
+        this.scheduleMediaHydration(decryptedNote);
 
         if (decryptedNote.isDecrypted) {
             await saveMessageLocally(decryptedNote);
@@ -109,9 +168,9 @@ export const MessageLifecycleManager = {
         queueMicrotask(async () => {
             const userId = localStorage.getItem('userId');
 
-            for (const att of note.attachments) {
-                const effectiveId = getEffectiveAttachmentId(att);
-                const cacheKey = `${note._id}_${effectiveId}`;
+            for (const [idx, att] of note.attachments.entries()) {
+                const effectiveId = getEffectiveAttachmentId(att, idx);
+                const cacheKey = getBlobCacheKey(note._id, att, idx);
 
                 // Skip if already in memory cache
                 if (blobCache.has(cacheKey)) continue;
@@ -131,7 +190,7 @@ export const MessageLifecycleManager = {
 
                     // Trigger pipeline (deduplicated by mediaDecryptionLocks)
                     if (att.url && !att.url.startsWith('blob:')) {
-                        runMediaDecryptionPipeline(note._id, att, aesKey, iv).catch(() => { });
+                        runMediaDecryptionPipeline(note._id, att, aesKey, iv, idx).catch(() => { });
                     }
                 } catch (err) {
                     console.warn(`[Hydration] Failed for ${note._id}/${effectiveId}`, err);

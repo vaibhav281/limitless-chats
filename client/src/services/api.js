@@ -34,13 +34,18 @@ export const editNoteAPI = async (id, payload) => {
   return res.data;
 };
 
-export const pinNoteAPI = async (id) => {
-  const res = await api.post(`/notes/pin/${id}`);
+export const pinNoteAPI = async (id, userId) => {
+  const res = await api.post(`/notes/pin/${id}`, { userId });
   return res.data;
 };
 
-export const unpinNoteAPI = async (id) => {
-  const res = await api.post(`/notes/unpin/${id}`);
+export const fetchPinnedNotesAPI = async (userId) => {
+  const res = await api.get(`/notes/pinned/${userId}`);
+  return res.data; // Array of IDs
+};
+
+export const unpinNoteAPI = async (id, userId) => {
+  const res = await api.post(`/notes/unpin/${id}`, { userId });
   return res.data;
 };
 

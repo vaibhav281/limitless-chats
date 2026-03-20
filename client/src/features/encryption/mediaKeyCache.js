@@ -42,7 +42,7 @@ export const mediaKeyCache = {
                     ...data,
                     cacheKey: compositeKey,
                     timestamp: Date.now(),
-                    version: 1
+                    version: data.version || 1
                 };
 
                 const request = store.put(entry, compositeKey);

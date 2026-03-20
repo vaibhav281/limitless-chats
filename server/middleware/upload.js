@@ -29,7 +29,7 @@ const fileFilter = (req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase().replace('.', '');
 
     // Path 1: E2EE Encrypted Blob bypass
-    if (file.mimetype === "application/octet-stream" && ext === "enc") {
+    if (ext === "enc") {
         return cb(null, true);
     }
 

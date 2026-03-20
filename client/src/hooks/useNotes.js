@@ -1,5 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
-import { fetchNotes, createNote, deleteNoteAPI, deleteMultipleNotesAPI, pinNoteAPI, unpinNoteAPI, editNoteAPI, fetchUnreadCountsAPI, markReadAPI, fetchConversationsAPI } from '../services/api';
+import { fetchNotes, createNote, deleteNoteAPI, deleteMultipleNotesAPI, pinNoteAPI, unpinNoteAPI, editNoteAPI, fetchUnreadCountsAPI, markReadAPI, fetchConversationsAPI, fetchPinnedNotesAPI } from '../services/api';
 import useSocket from './useSocket';
 import useMessageStatus from './useMessageStatus';
 import useEncryptedMessaging from './useEncryptedMessaging';
@@ -7,6 +7,8 @@ import { saveMessageLocally, getMessageLocally } from '../features/encryption/lo
 import { mediaKeyCache } from '../features/encryption/mediaKeyCache';
 import { blobCache } from '../features/encryption/blobCache';
 import { MessageLifecycleManager } from '../features/encryption/MessageLifecycleManager';
+import { getBlobCacheKey } from '../features/encryption/cryptoService';
+import { decryptMessage } from '../features/encryption/messageDecryptor';
 
 // Helper to reliably merge notes chronologically (Adjustment 3)
 function mergeMessages(existing, incoming) {
@@ -33,6 +35,7 @@ export default function useNotes(initialLimit = 20, chatWithId = null, username 
 
   const [notes, setNotes] = useState([]);
   const [hasMore, setHasMore] = useState(true);
+  const [pinnedMessageIds, setPinnedMessageIds] = useState(new Set());
   const [unreadCounts, setUnreadCounts] = useState({});
   const [conversations, setConversations] = useState([]);
   const loadingRef = useRef(false);
@@ -51,6 +54,10 @@ export default function useNotes(initialLimit = 20, chatWithId = null, username 
     fetchConversationsAPI(userId)
       .then(convs => setConversations(convs))
       .catch(err => console.error("Error fetching conversations:", err));
+
+    fetchPinnedNotesAPI(userId)
+      .then(pins => setPinnedMessageIds(new Set(pins)))
+      .catch(err => console.error("Error fetching pins:", err));
   }, [userId]);
 
   useEffect(() => {
@@ -157,23 +164,106 @@ export default function useNotes(initialLimit = 20, chatWithId = null, username 
       }
     });
 
-    socket.on('noteUpdated', (updatedNote) => {
-      setNotes(prev => prev.map(n => n._id === updatedNote._id ? updatedNote : n));
+    socket.on('noteUpdated', async (updatedNote) => {
+      // 1. FORCED DECRYPTION LAYER
+      // 🔴 CRITICAL: Server sends ciphertextEdit. DO NOT use decryptIncoming() for edits!
+      // decryptIncoming() has a cache-first pattern that returns stale v1 text.
+      const encryptedPayload = updatedNote.ciphertextEdit;
+      let decryptedEdit = "";
+      let editReady = false;
 
-      // Update sidebar preview if the edited note is the last message
+      if (updatedNote.isEdited && encryptedPayload) {
+         try {
+             const currentUserId = localStorage.getItem('userId');
+             if (updatedNote.senderId === currentUserId) {
+                 // SENDER: Use local cache (we just encrypted this, plaintext is already cached)
+                 const cached = await mediaKeyCache.getMediaKey(currentUserId, updatedNote._id, 'text');
+                 if (cached?.decryptedText) {
+                     decryptedEdit = cached.decryptedText;
+                     editReady = true;
+                 }
+             } else {
+                 // 🔴 RECEIVER: Call raw decryptMessage() directly — BYPASS decryptIncoming()
+                 // decryptIncoming() would return stale cached text from v1, which is THE bug.
+                 const rawDecrypted = await decryptMessage(
+                     updatedNote.senderId,
+                     updatedNote.editType || 1,
+                     encryptedPayload
+                 );
+                 if (rawDecrypted && typeof rawDecrypted === 'string') {
+                     decryptedEdit = rawDecrypted;
+                     editReady = true;
+                     // Save to cache with version so hydration works after refresh
+                     await mediaKeyCache.saveMediaKey(currentUserId, updatedNote._id, 'text', { 
+                         decryptedText: decryptedEdit,
+                         version: updatedNote.version
+                     });
+                 } else if (rawDecrypted && rawDecrypted.error) {
+                     console.warn("Edit decrypt failed:", rawDecrypted.reason);
+                 }
+             }
+         } catch(e) { console.warn("Socket Edit Decrypt Fail", e); }
+      }
+
+      // 2. STATE AUTHORITY LAYER
+      setNotes(prev => {
+          const localNote = prev.find(n => n._id === updatedNote._id);
+          
+          // 🔴 Delete-for-all ALWAYS passes through — no version check for deletes
+          if (updatedNote.isDeletedForEveryone) {
+              return prev.map(n => n._id === updatedNote._id 
+                  ? { ...n, isDeletedForEveryone: true, noteText: "", plaintextEdit: "", attachments: [], status: 'sent', isEditReady: true }
+                  : n
+              );
+          }
+          
+          // 🔴 CRITICAL VERSION LOCK: Drop older or equal packets (edits only)
+          if (localNote && localNote.version >= updatedNote.version) {
+              return prev; 
+          }
+
+          const applyUpdate = (local) => {
+              if (updatedNote.isDeletedForEveryone) {
+                  return { ...local, isDeletedForEveryone: true, noteText: "", plaintextEdit: "", attachments: [], status: 'sent', isEditReady: true };
+              }
+              // 🔴 RULE 12: ATOMIC STATE UPDATE — all fields together
+              return {
+                  ...local,
+                  version: updatedNote.version,
+                  isEdited: updatedNote.isEdited,
+                  isEditReady: editReady,
+                  editedAt: updatedNote.editedAt,
+                  plaintextEdit: decryptedEdit, 
+                  isPinned: updatedNote.isPinned,
+                  isDeleted: updatedNote.isDeleted,
+                  status: 'sent'
+              };
+          };
+          return prev.map(n => n._id === updatedNote._id ? applyUpdate(n) : n);
+      });
+
+      // 3. SIDEBAR SYNC LAYER
       setConversations(prev => prev.map(conv => {
-        if (conv.lastMessage._id === updatedNote._id) {
-          return {
-            ...conv,
-            lastMessage: {
-              ...conv.lastMessage,
-              noteText: updatedNote.noteText,
+        if (conv.lastMessage?._id === updatedNote._id) {
+          // Delete-for-all always passes through
+          if (!updatedNote.isDeletedForEveryone && conv.lastMessage.version >= updatedNote.version) return conv;
+          
+          const newLastMsg = { 
+              ...conv.lastMessage, 
+              version: updatedNote.version,
               isEdited: updatedNote.isEdited,
+              isEditReady: editReady,
+              editedAt: updatedNote.editedAt,
+              plaintextEdit: decryptedEdit,
               isDeletedForEveryone: updatedNote.isDeletedForEveryone,
               isDeleted: updatedNote.isDeleted,
-              attachments: updatedNote.attachments
-            }
+              isPinned: updatedNote.isPinned
           };
+          if (updatedNote.isDeletedForEveryone) {
+              newLastMsg.noteText = "";
+              newLastMsg.attachments = [];
+          }
+          return { ...conv, lastMessage: newLastMsg };
         }
         return conv;
       }));
@@ -249,6 +339,7 @@ export default function useNotes(initialLimit = 20, chatWithId = null, username 
         finalOptimisticNote = {
           ...newNote,
           _id: newNote._id || Date.now().toString(),
+          version: 1, // 🔴 CRITICAL: Force version on new message
           noteText: plaintext,
           isDecrypted: true,
           status: "sent"
@@ -277,7 +368,11 @@ export default function useNotes(initialLimit = 20, chatWithId = null, username 
               const attachId = srvAtt.attachmentId || srvAtt.fileIndex || idx;
               const volatileBlobUrl = cachedSentInfo.attachments[idx]?.url;
               if (volatileBlobUrl && volatileBlobUrl.startsWith('blob:')) {
-                blobCache.set(`${newNote._id}_${attachId}`, volatileBlobUrl);
+                blobCache.set(getBlobCacheKey(newNote._id, srvAtt, idx), {
+                  url: volatileBlobUrl,
+                  mimeType: srvAtt.originalMimeType || srvAtt.type,
+                  fileName: srvAtt.fileName || srvAtt.originalName
+                });
               }
 
               return {
@@ -292,6 +387,7 @@ export default function useNotes(initialLimit = 20, chatWithId = null, username 
 
         finalOptimisticNote = {
           ...newNote,
+          version: 1, // 🔴 CRITICAL: Force version on new message (attachments)
           noteText: noteText,
           attachments: finalAttachments,
           isDecrypted: true,
@@ -366,25 +462,63 @@ export default function useNotes(initialLimit = 20, chatWithId = null, username 
 
   const editNote = useCallback(async (id, newText) => {
     try {
-      const updated = await editNoteAPI(id, { noteText: newText, userId });
-      setNotes(prev => prev.map(n => (n._id === id ? updated : n)));
+      // ✅ E2EE FIX: Sender MUST encrypt the edited text before dispatching!
+      const { ciphertext, type: editType } = await encryptOutgoing(chatWithId, newText, []);
+      const updated = await editNoteAPI(id, { noteText: ciphertext, editType, userId });
+      const currentUserId = localStorage.getItem('userId');
+      const targetNote = notes.find(n => n._id === id);
+      const newVersion = (targetNote?.version || 1) + 1;
+      
+      // ✅ Cache the decrypted plaintext locally so hydration survives!
+      await mediaKeyCache.saveMediaKey(currentUserId, id, 'text', {
+          decryptedText: newText,
+          version: newVersion // 🔴 CRITICAL: Store version during edit (Sender Side)
+      });
+      
+      setNotes(prev => prev.map(n => {
+        if (n._id === id) {
+           return {
+             ...n,
+             version: newVersion, // 🔴 CRITICAL: Optimistic UI MUST SET VERSION
+             // DO NOT overwrite noteText (immutable).
+             // Set optimistic plaintextEdit for instant feedback.
+             plaintextEdit: newText,
+             isEdited: true,
+             isEditReady: true, // 🔴 Sender already has plaintext — ready immediately
+             editedAt: updated.editedAt || new Date().toISOString()
+           };
+        }
+        return n;
+      }));
       return updated;
     } catch (err) {
       console.error(err);
       alert("Failed to edit note. You may not be the author.");
       throw err;
     }
-  }, [userId]);
+  }, [userId, chatWithId, encryptOutgoing]);
 
   const pinNote = useCallback(async (id) => {
-    const updated = await pinNoteAPI(id);
-    setNotes(prev => prev.map(n => (n._id === id ? updated : n)));
-  }, []);
+    try {
+      await pinNoteAPI(id, userId);
+      setPinnedMessageIds(prev => {
+        const next = new Set(prev);
+        next.add(id);
+        return next;
+      });
+    } catch(err) { console.error(err); }
+  }, [userId]);
 
   const unpinNote = useCallback(async (id) => {
-    const updated = await unpinNoteAPI(id);
-    setNotes(prev => prev.map(n => (n._id === id ? updated : n)));
-  }, []);
+    try {
+      await unpinNoteAPI(id, userId);
+      setPinnedMessageIds(prev => {
+         const next = new Set(prev);
+         next.delete(id);
+         return next;
+      });
+    } catch(err) { console.error(err); }
+  }, [userId]);
 
   const fetchNotesAgain = useCallback(loadLatest, [loadLatest]);
 
@@ -392,13 +526,20 @@ export default function useNotes(initialLimit = 20, chatWithId = null, username 
   useEffect(() => {
     setNotes([]);
     setHasMore(true);
+    if (userId) {
+       fetchPinnedNotesAPI(userId).then(pins => setPinnedMessageIds(new Set(pins))).catch(err => console.error(err));
+    }
     if (chatWithId) {
       loadLatest();
     }
-  }, [chatWithId, loadLatest]);
+  }, [chatWithId, loadLatest, userId]);
 
   const cacheSentMessage = useCallback((cText, plainText, plainAttachments) => {
     sentMessagesCache.current.set(cText, { text: plainText, attachments: plainAttachments });
+  }, []);
+
+  const getSentMessage = useCallback((cText) => {
+    return sentMessagesCache.current.get(cText);
   }, []);
 
   return {
@@ -420,6 +561,8 @@ export default function useNotes(initialLimit = 20, chatWithId = null, username 
     setUnreadCounts,
     conversations,
     socket,
-    cacheSentMessage
+    cacheSentMessage,
+    getSentMessage,
+    pinnedMessageIds
   };
 }

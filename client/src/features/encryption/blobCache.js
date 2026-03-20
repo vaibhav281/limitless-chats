@@ -28,14 +28,14 @@ class LRUBlobCache {
             // If we are at capacity, evict the earliest (oldest) entry
             // Map.prototype.keys() returns items in insertion order
             const oldestKey = this.cache.keys().next().value;
-            const oldestUrl = this.cache.get(oldestKey);
+            const oldestVal = this.cache.get(oldestKey);
 
             this.cache.delete(oldestKey);
 
-            // Critical Memory Release: Destroy the underlying browser blob reference
-            if (oldestUrl && oldestUrl.startsWith('blob:')) {
-                URL.revokeObjectURL(oldestUrl);
-            }
+            // Critical Memory Release: Delegate to centralized ref-counter
+            import('../../services/mediaMemoryManager').then(({ release }) => {
+                release(oldestKey);
+            }).catch(() => {});
         }
         this.cache.set(key, value);
     }

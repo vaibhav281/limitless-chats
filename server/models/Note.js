@@ -13,6 +13,7 @@ const noteSchema = new mongoose.Schema(
                 id: { type: String }, // Canonical content hash (SHA-256)
                 url: { type: String }, // Relative path to file
                 type: { type: String }, // 'image', 'video'
+                originalMimeType: { type: String }, // Restores explicitly accurate playback after E2EE deciphering
                 originalName: { type: String },
                 size: { type: Number }, // File size in bytes
                 encryptedBlobUrl: { type: String },
@@ -29,17 +30,26 @@ const noteSchema = new mongoose.Schema(
         senderId: { type: String, required: true },
         senderName: { type: String, default: "Anonymous" },
         receiverId: { type: String, required: true },
+        // Editing functionality (Immutable Versioning)
+        version: { type: Number, default: 1 }, // 🔴 CRITICAL: Architecturally mandated version lock
         isEdited: { type: Boolean, default: false },
-        editedAt: { type: Date, default: null },
+        ciphertextEdit: { type: String, default: null },
+        editType: { type: Number, default: 1 }, // Signal message type for edit ciphertext
+        editedAt: { type: Date },
+        editHistory: [{
+            noteText: String,
+            editedAt: Date
+        }],
         isDeletedForEveryone: { type: Boolean, default: false },
         deletedForUsers: [{ type: String }],
         replyTo: { type: mongoose.Schema.Types.ObjectId, ref: "Note", default: null },
         isGroup: { type: Boolean, default: false },
         isRead: { type: Boolean, default: false },
         readBy: [{ type: String }],
+        deliveredTo: [{ type: String }],
         status: { type: String, enum: ["sent", "delivered", "seen"], default: "sent" },
-        deliveredAt: { type: Date, default: null },
-        seenAt: { type: Date, default: null },
+        deliveredAt: { type: Date },
+        seenAt: { type: Date },
     },
     { timestamps: true }
 );

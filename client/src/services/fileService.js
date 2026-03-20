@@ -40,14 +40,15 @@ export const downloadFileWithProgress = async (url, originalName, onProgress, ca
     });
 
     // Trigger download in browser
-    const blob = new Blob([response.data]);
+    // Using octet-stream as a safe fallback for binary data if a real MIME isn't present
+    const blob = new Blob([response.data], { type: "application/octet-stream" });
     const link = document.createElement("a");
     link.href = window.URL.createObjectURL(blob);
     link.download = originalName || "download";
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
-    window.URL.revokeObjectURL(link.href);
+    setTimeout(() => window.URL.revokeObjectURL(link.href), 5000);
 };
 
 /**
@@ -88,5 +89,5 @@ export const downloadAndDecryptFileWithProgress = async (url, originalName, aesK
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
-    window.URL.revokeObjectURL(link.href);
+    setTimeout(() => window.URL.revokeObjectURL(link.href), 5000);
 };

@@ -25,7 +25,7 @@ export default function useFileUpload() {
 
             setFileProgress((prev) => ({
                 ...prev,
-                [tempId]: { progress: 100, status: 'completed', cancelSource: null }
+                [tempId]: { progress: 100, status: 'sent', cancelSource: null }
             }));
 
             return response.data; // The actual created Note object

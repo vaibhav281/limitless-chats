@@ -56,7 +56,7 @@ export default function ChatInput({
                 {editingNote ? "Editing Message" : "Replying to"}
               </Typography>
               <Typography variant="body2" noWrap sx={{ color: "#8696a0" }}>
-                {editingNote ? editingNote.noteText : (replyingTo?.attachments?.length > 0 ? "Photo/Video" : replyingTo?.noteText)}
+                {editingNote ? ((editingNote.isEdited && editingNote.plaintextEdit) ? editingNote.plaintextEdit : editingNote.noteText) : (replyingTo?.attachments?.length > 0 ? "Photo/Video" : replyingTo?.noteText)}
               </Typography>
             </Box>
             <IconButton size="small" onClick={() => { setReplyingTo(null); setEditingNote(null); inputRef.current.value = ""; }} sx={{ color: "#aebac1" }}>

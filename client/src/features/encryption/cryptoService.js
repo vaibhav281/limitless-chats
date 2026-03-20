@@ -2,6 +2,7 @@ import { Buffer } from 'buffer';
 import axios from 'axios';
 import { persistentBlobStore } from './persistentBlobStore';
 import { blobCache } from './blobCache';
+import { bindUrl } from '../../services/mediaMemoryManager';
 
 // Global Deduplication Lock Registry for Media Decryption
 // Ensures that multiple UI components requesting the same media only trigger ONE pipeline execution.
@@ -59,7 +60,7 @@ export async function encryptFile(file) {
     const keyBase64 = uint8ToBase64(new Uint8Array(keyRaw));
 
     return {
-        ciphertextBlob: new Blob([ciphertext]),
+        ciphertextBlob: new Blob([ciphertext], { type: file.type || 'application/octet-stream' }),
         ciphertextBuffer: new Uint8Array(ciphertext),
         keyBase64,
         ivBase64
@@ -107,28 +108,35 @@ export const decryptFile = async (ciphertextBlob, aesKeyInput, ivInput, original
 /**
  * Resolves a stable ID for an attachment. 
  * PRIORITIES: 
- * 1. Canonical 'id' (SHA-256 Content Hash)
- * 2. Attachment UUID ('attachmentId')
- * 3. File Index ('fileIndex')
- * 4. FALLBACK: originalName
+ * 1. fileHash (The Gold Standard)
+ * 2. Canonical 'id' (SHA-256 Content Hash)
+ * 3. Attachment UUID ('attachmentId')
+ * 4. File Index ('fileIndex')
  */
 export function getEffectiveAttachmentId(attachment, indexFallback = 0) {
     if (!attachment) return `unknown_${indexFallback}`;
 
-    // 1. Canonical Content Hash (The Gold Standard)
+    // 1. Explicit File Hash
+    if (attachment.fileHash) return attachment.fileHash;
+
+    // 2. Canonical id
     if (attachment.id) return attachment.id;
 
-    // 2. Client-generated UUID (Wait until Phase 3 migration finishes)
+    // 3. Client-generated UUID
     if (attachment.attachmentId) return attachment.attachmentId;
 
-    // 3. File Index (from Signal, for attachments in a message)
+    // 4. File Index (from Signal, for attachments in a message)
     if (attachment.fileIndex !== undefined) return attachment.fileIndex;
-    if (attachment.index !== undefined) return attachment.index; // Legacy/fallback index
-
-    // 4. Fallback to original name (least stable)
-    if (attachment.originalName) return attachment.originalName;
+    if (attachment.index !== undefined) return attachment.index;
 
     return `unknown_${indexFallback}`;
+}
+
+export function getBlobCacheKey(noteId, attachment, index = 0) {
+  if (attachment?.fileHash) return attachment.fileHash;
+  if (attachment?.id) return attachment.id;
+  if (attachment?.attachmentId) return attachment.attachmentId;
+  return `${noteId}_${index}`;
 }
 
 /**
@@ -138,9 +146,9 @@ export function getEffectiveAttachmentId(attachment, indexFallback = 0) {
  * 3. Fetches, decrypts, and persists results.
  * 4. Returns a usable Object URL.
  */
-export const runMediaDecryptionPipeline = async (noteId, attachment, aesKey, iv) => {
-    const attachmentId = getEffectiveAttachmentId(attachment, attachment.index);
-    const cacheKey = `${noteId}_${attachmentId}`;
+export const runMediaDecryptionPipeline = async (noteId, attachment, aesKey, iv, index = 0) => {
+    const attachmentId = getEffectiveAttachmentId(attachment, index);
+    const cacheKey = getBlobCacheKey(noteId, attachment, index);
 
     // 1. Enforce Deduplication Lock (Mutex)
     if (mediaDecryptionLocks.has(cacheKey)) {
@@ -151,8 +159,8 @@ export const runMediaDecryptionPipeline = async (noteId, attachment, aesKey, iv)
     const pipelinePromise = (async () => {
         try {
             // 2. Check LRU Cache (RAM)
-            const cachedUrl = blobCache.get(cacheKey);
-            if (cachedUrl) return cachedUrl;
+            const boxed = safeUnboxCachedUrl(blobCache.get(cacheKey));
+            if (boxed && boxed.url) return boxed.url;
 
             // 3. Sender Preview / Plaintext Bypass
             // If the URL is already a local blob, it's plaintext. Skip pipeline!
@@ -168,7 +176,7 @@ export const runMediaDecryptionPipeline = async (noteId, attachment, aesKey, iv)
             const cachedBlob = await persistentBlobStore.getMedia(noteId, attachmentId, resolvedMimeType);
             if (cachedBlob) {
                 const url = URL.createObjectURL(cachedBlob);
-                blobCache.set(cacheKey, url);
+                blobCache.set(cacheKey, { url, mimeType: resolvedMimeType, fileName: attachment.fileName || attachment.originalName });
                 return url;
             }
 
@@ -176,7 +184,8 @@ export const runMediaDecryptionPipeline = async (noteId, attachment, aesKey, iv)
             // If we are missing keys/URL, we return null gracefully. 
             // The UI will show a loading/error state until next hydration.
             if (!aesKey || !iv || !attachment.url) {
-                return null;
+                console.warn("[cryptoService] Missing metadata");
+                return { failed: true };
             }
 
             console.log(`[cryptoService] Starting network pipeline for ${attachment.originalName}`);
@@ -194,7 +203,8 @@ export const runMediaDecryptionPipeline = async (noteId, attachment, aesKey, iv)
 
             // 6. Push to LRU and Return URL
             const finalUrl = URL.createObjectURL(decryptedBlob);
-            blobCache.set(cacheKey, finalUrl);
+            blobCache.set(cacheKey, { url: finalUrl, mimeType: resolvedMimeType, fileName: attachment.fileName || attachment.originalName });
+            bindUrl(cacheKey, finalUrl, { mimeType: resolvedMimeType, fileName: attachment.fileName || attachment.originalName });
 
             return finalUrl;
 
@@ -240,6 +250,21 @@ export function base64ToBuffer(base64) {
         bytes[i] = binary.charCodeAt(i);
     }
     return bytes.buffer;
+}
+
+/**
+ * Ensures we always get a structured object when reading from cache,
+ * whether the legacy cache saved a string or the new cache saved an object.
+ */
+export function safeUnboxCachedUrl(entry) {
+  if (!entry) return null;
+  if (typeof entry === 'string') return { url: entry, mimeType: null, fileName: null };
+  if (entry && typeof entry === 'object' && entry.url) return {
+    url: entry.url,
+    mimeType: entry.mimeType || null,
+    fileName: entry.fileName || null
+  };
+  return null;
 }
 
 /**

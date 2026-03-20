@@ -15,8 +15,11 @@ import CloseIcon from "@mui/icons-material/Close";
 import Webcam from "react-webcam";
 import CameraAltIcon from '@mui/icons-material/CameraAlt';
 import KeyboardArrowDownIcon from '@mui/icons-material/KeyboardArrowDown';
+import KeyboardArrowLeftIcon from '@mui/icons-material/KeyboardArrowLeft';
+import KeyboardArrowRightIcon from '@mui/icons-material/KeyboardArrowRight';
 import axios from 'axios';
 import { blobCache } from '../features/encryption/blobCache';
+import { runMediaDecryptionPipeline, getBlobCacheKey } from '../features/encryption/cryptoService';
 import dayjs from "dayjs";
 import isToday from "dayjs/plugin/isToday";
 import isYesterday from "dayjs/plugin/isYesterday";
@@ -57,7 +60,7 @@ export default function DailyNotesPage() {
   }, []);
 
   const [chatWithId, setChatWithId] = useState(null);
-  const { notes, setNotes, loadLatest, loadOlder, addNote, deleteNote, deleteMany, pinNote, unpinNote, hasMore, fetchNotes, activeUsers, userId, editNote, unreadCounts, setUnreadCounts, conversations, socket, cacheSentMessage } = useNotes(20, chatWithId, username);
+  const { notes, setNotes, loadLatest, loadOlder, addNote, deleteNote, deleteMany, pinNote, unpinNote, hasMore, fetchNotes, activeUsers, userId, editNote, unreadCounts, setUnreadCounts, conversations, socket, cacheSentMessage, pinnedMessageIds } = useNotes(20, chatWithId, username);
   const { fileProgress, uploadFiles, downloadFile, cancelTask, retryTask } = useFileUpload();
   const { encryptOutgoing } = useEncryptedMessaging(userId);
 
@@ -203,6 +206,26 @@ export default function DailyNotesPage() {
     e.target.value = null;
   };
 
+  const handleClosePreview = () => {
+    // Critical Memory Cleanup: revoke unused preview URLs before dumping state
+    previewFiles.forEach(pf => {
+      if (pf.url && pf.url.startsWith('blob:')) URL.revokeObjectURL(pf.url);
+    });
+    setPreviewFiles([]);
+    setCaption("");
+    setOpenPreview(false);
+  };
+
+  const handleRemovePreview = (idx) => {
+    setPreviewFiles(prev => {
+        const urlToRevoke = prev[idx]?.url;
+        if (urlToRevoke && urlToRevoke.startsWith('blob:')) {
+            URL.revokeObjectURL(urlToRevoke);
+        }
+        return prev.filter((_, i) => i !== idx);
+    });
+  };
+
   const handleSendAttachments = async () => {
     if(previewFiles.length === 0 && !caption.trim()) return;
     shouldAutoScrollRef.current = true;
@@ -235,10 +258,23 @@ export default function DailyNotesPage() {
         cacheSentMessage(ciphertext, textTarget, optimisticAttachments);
     } catch (err) {
         alert(`Could not securely encrypt attachments: ${err.message}`);
-        setPreviewFiles([]); setCaption(""); setOpenPreview(false); setReplyingTo(null); setEditingNote(null);
+        handleClosePreview();
+        setReplyingTo(null); setEditingNote(null);
         setIsUploading(false);
         return;
     }
+
+    // 5. Global Timeout Guard (Prevent Stuck Upload UI States)
+    // Automatically transitions the task to 'failed' if stranded for 30s
+    setTimeout(() => {
+        setNotes(prev => prev.map(n => {
+            const task = fileProgress[n._id];
+            if (n._id === tempId && task && task.status === 'uploading') {
+                return { ...n, status: 'failed' };
+            }
+            return n;
+        }));
+    }, 30000);
 
     formData.append('ciphertext', ciphertext);
     formData.append('type', type);
@@ -258,17 +294,10 @@ export default function DailyNotesPage() {
          formData.append('files', ef.blob, encryptedFileName);
          
          // Build structured metadata
-         let parsedMap = {};
-         try {
-             parsedMap = JSON.parse(ef.encryptedKeysMap);
-         } catch (e) {
-             console.warn("Could not parse keys map for metadata", e);
-         }
-
          attachmentsMeta.push({
              id: ef.id,
              fileName: ef.originalName, // THE HUMAN READABLE NAME
-             encryptedKeysMap: parsedMap,
+             encryptedKeysMap: typeof ef.encryptedKeysMap === 'string' ? JSON.parse(ef.encryptedKeysMap) : (ef.encryptedKeysMap || {}),
              iv: ef.iv,
              originalMimeType: ef.originalMimeType,
              type: ef.type,
@@ -308,7 +337,7 @@ export default function DailyNotesPage() {
               const volatileBlobUrl = optimisticAttachments[idx]?.url;
               
               if (volatileBlobUrl && volatileBlobUrl.startsWith('blob:')) {
-                  blobCache.set(`${realNote._id}_${attachId}`, volatileBlobUrl);
+                  blobCache.set(getBlobCacheKey(realNote._id, serverAtt), volatileBlobUrl);
               }
 
               return {
@@ -337,27 +366,62 @@ export default function DailyNotesPage() {
 
       // Backend returned the new Document. The Socket may have already emitted and added it to the array.
       setNotes(prev => {
-         const existingNote = prev.find(n => n._id === realNote._id);
-         if (existingNote) {
-            // Socket already inserted it. Filter out tempId, and OVERWRITE socket's version with secure local version
-            // CRITICAL FIX: We MUST preserve any 'delivered' or 'seen' status that the Socket received while we were uploading!
+         const hasSocket = prev.some(n => n._id === realNote._id);
+         if (hasSocket) {
+            // Socket already inserted it. OVERWRITE socket's version with secure local version
             return prev
               .filter(n => n._id !== tempId)
               .map(n => n._id === realNote._id ? { 
                   ...realNoteForSender,
-                  status: existingNote.status !== 'sent' ? existingNote.status : realNoteForSender.status,
-                  isRead: existingNote.isRead,
-                  deliveredAt: existingNote.deliveredAt,
-                  seenAt: existingNote.seenAt 
+                  attachments: tempNote.attachments, // ✅ KEEP LOCAL BLOBS
+                  status: 'sent'
               } : n);
          }
          // Socket hasn't fired yet. Swap the temporary mock with the verified real note.
-         return prev.map(n => n._id === tempId ? realNoteForSender : n);
+         return prev.map(n => n._id === tempId ? {
+             ...realNoteForSender,
+             attachments: n.attachments, // ✅ KEEP LOCAL BLOBS
+             status: 'sent'
+         } : n);
       });
     } catch(err) {
       console.error("Upload failed", err);
       setNotes(prev => prev.map(n => n._id === tempId ? { ...n, status: 'failed' } : n));
     }
+  };
+
+  const handleRetryTask = async (noteId) => {
+      const note = notes.find(n => n._id === noteId);
+      if (!note) return;
+
+      const cachedData = note.ciphertext ? getSentMessage(note.ciphertext) : null;
+      if (!cachedData || !(cachedData.attachments || []).length) {
+          alert('Cannot safely recover encrypted files. Please select the files manually again.');
+          return;
+      }
+
+      // 1. Clear dead UI
+      cancelTask(noteId);
+      setNotes(prev => prev.filter(n => n._id !== noteId));
+
+      // 2. Decipher drafts back into interactive payloads!
+      try {
+          const rehydratedFiles = await Promise.all(
+              cachedData.attachments.map(async att => {
+                  const res = await fetch(att.url);
+                  const blob = await res.blob();
+                  const file = new File([blob], att.originalName, { type: att.type });
+                  return { file, url: att.url, type: att.type, origName: att.originalName };
+              })
+          );
+          
+          setCaption(cachedData.text || "");
+          setPreviewFiles(rehydratedFiles.filter(f => f));
+          setOpenPreview(true);
+      } catch (e) {
+          console.error("Draft recover error", e);
+          alert("Some offline attachments could not be unpacked from drafts.");
+      }
   };
 
   const handleSend = async () => {
@@ -442,7 +506,8 @@ export default function DailyNotesPage() {
     setSelectedNotes([]);
     setShowActionBar(false);
     if (inputRef.current) {
-        inputRef.current.value = note.noteText;
+        // Use the latest text: plaintextEdit for edited messages, noteText for originals
+        inputRef.current.value = (note.isEdited && note.plaintextEdit) ? note.plaintextEdit : note.noteText;
         inputRef.current.focus();
     }
   };
@@ -450,7 +515,7 @@ export default function DailyNotesPage() {
   const handlePin = () => {
     selectedNotes.forEach(id => {
        const note = notes.find(n => n._id === id);
-       if (note) note.pinned ? unpinNote(id) : pinNote(id);
+       if (note) pinnedMessageIds.has(id) ? unpinNote(id) : pinNote(id);
     });
     handleCancelAction();
   };
@@ -473,7 +538,7 @@ export default function DailyNotesPage() {
   const canEdit = selectedNotes.length === 1 && (() => {
       const n = notes.find(n => n._id === selectedNotes[0]);
       if (!n) return false;
-      const isMine = n.senderId === userId;
+      const isMine = String(n.senderId) === String(userId);
       const hasNoAttachments = !n.attachments?.length;
       const isNotDeleted = !(n.isDeletedForEveryone || n.isDeletedForMe || n.isDeleted);
       const isUnder15Mins = (Date.now() - new Date(n.timestamp).getTime()) <= 900000;
@@ -569,6 +634,7 @@ export default function DailyNotesPage() {
                           
                           <MessageBubble 
                             note={note}
+                            allNotes={notes}
                             userId={userId}
                             isSelected={selectedNotes.includes(note._id)}
                             onPress={handleNotePress}
@@ -578,9 +644,10 @@ export default function DailyNotesPage() {
                             fileProgress={fileProgress}
                             downloadFile={downloadFile}
                             cancelTask={cancelTask}
-                            retryTask={retryTask}
+                            retryTask={handleRetryTask}
                             currentUser={{ username }}
                             onRightClick={handleRightClick}
+                            isPinned={pinnedMessageIds.has(note._id)}
                           />
                         </React.Fragment>
                       );
@@ -630,7 +697,7 @@ export default function DailyNotesPage() {
               >
                 <Box sx={{ p: 2, display: 'flex', flexDirection: 'column', gap: 1 }}>
                    <Typography variant="body1" sx={{ mb: 1, fontWeight: 500, px: 1 }}>Delete message?</Typography>
-                   {selectedNotes.length === 1 && notes.find(n => n._id === selectedNotes[0])?.senderId === userId && (Date.now() - new Date(notes.find(n => n._id === selectedNotes[0])?.timestamp).getTime() < 86400000) && (
+                   {selectedNotes.length === 1 && String(notes.find(n => n._id === selectedNotes[0])?.senderId) === String(userId) && (Date.now() - new Date(notes.find(n => n._id === selectedNotes[0])?.timestamp).getTime() < 86400000) && (
                       <Button fullWidth sx={{ color: "#f15c6d", bgcolor: "transparent", '&:hover': { bgcolor: "rgba(255,255,255,0.05)" }, justifyContent: 'flex-end', px: 3, py: 1.5, textTransform: 'none', fontSize: '1rem' }} onClick={() => handleConfirmDelete('for_everyone')}>
                           Delete for everyone
                       </Button>
@@ -655,8 +722,8 @@ export default function DailyNotesPage() {
 
       {/* Helper Modals */}
       <PreviewModal 
-        openPreview={openPreview} setOpenPreview={setOpenPreview} previewFiles={previewFiles}
-        handleRemovePreview={(idx) => setPreviewFiles(prev => prev.filter((_, i) => i !== idx))}
+        openPreview={openPreview} handleClosePreview={handleClosePreview} previewFiles={previewFiles}
+        handleRemovePreview={handleRemovePreview}
         fileInputRef={fileInputRef} caption={caption} setCaption={setCaption}
         handleSendAttachments={handleSendAttachments} isUploading={isUploading}
       />
@@ -689,7 +756,16 @@ export default function DailyNotesPage() {
                </Typography>
                <IconButton onClick={() => setViewingMedia(null)} sx={{ color: "#fff" }}><CloseIcon /></IconButton>
             </Box>
-            <Box sx={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden", p: 2 }}>
+            <Box sx={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden", p: 2, position: "relative" }}>
+               {viewingMedia?.items?.length > 1 && viewingMedia.currentIndex > 0 && (
+                   <IconButton 
+                       onClick={() => setViewingMedia({ ...viewingMedia, currentIndex: viewingMedia.currentIndex - 1 })}
+                       sx={{ position: "absolute", left: { xs: 8, sm: 24 }, bgcolor: "rgba(0,0,0,0.5)", color: "#fff", '&:hover': { bgcolor: "rgba(0,0,0,0.8)" }, zIndex: 10 }}
+                   >
+                       <KeyboardArrowLeftIcon fontSize="large" />
+                   </IconButton>
+               )}
+
                {viewingMedia?.items[viewingMedia.currentIndex]?.type === 'image' ? (
                   <img src={viewingMedia.items[viewingMedia.currentIndex].url} alt="enlarged" style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain" }} />
                ) : viewingMedia?.items[viewingMedia.currentIndex]?.type === 'video' ? (
@@ -700,6 +776,15 @@ export default function DailyNotesPage() {
                   <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2 }}>
                      <Typography sx={{ color: '#fff' }}>Preview not available for this file type.</Typography>
                   </Box>
+               )}
+
+               {viewingMedia?.items?.length > 1 && viewingMedia.currentIndex < viewingMedia.items.length - 1 && (
+                   <IconButton 
+                       onClick={() => setViewingMedia({ ...viewingMedia, currentIndex: viewingMedia.currentIndex + 1 })}
+                       sx={{ position: "absolute", right: { xs: 8, sm: 24 }, bgcolor: "rgba(0,0,0,0.5)", color: "#fff", '&:hover': { bgcolor: "rgba(0,0,0,0.8)" }, zIndex: 10 }}
+                   >
+                       <KeyboardArrowRightIcon fontSize="large" />
+                   </IconButton>
                )}
             </Box>
 
