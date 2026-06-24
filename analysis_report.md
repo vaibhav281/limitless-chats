@@ -1,6 +1,6 @@
 # Analysis Report: UI and File Naming Bugs
 
-## Overview of Issues from Images & JSON
+## Overview of Issues from Images & JSON     
 Based on the provided images and JSON payload analysis, there are **three primary issues** currently affecting the application flow:
 
 ### 1. The ".enc" Hash Naming Bug
