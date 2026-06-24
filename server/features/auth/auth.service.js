@@ -13,6 +13,12 @@ class AuthService {
         let passwordHash = null;
         if (authProvider === "local") {
             if (!password) throw new Error("Password is required for local authentication");
+            
+            // Password complexity validation
+            if (password.length < 8) {
+                throw new Error("Password must be at least 8 characters long");
+            }
+            
             // Hash password
             const salt = await bcrypt.genSalt(10);
             passwordHash = await bcrypt.hash(password, salt);
@@ -41,9 +47,28 @@ class AuthService {
                 throw new Error(`This account uses ${user.authProvider} login.`);
             }
 
+            // Check if account is locked
+            if (user.lockUntil && user.lockUntil > Date.now()) {
+                const minutesLeft = Math.ceil((user.lockUntil - Date.now()) / 60000);
+                throw new Error(`Account temporarily locked. Try again in ${minutesLeft} minutes.`);
+            }
+
             const isMatch = await bcrypt.compare(password, user.passwordHash);
             if (!isMatch) {
+                // Increment login attempts
+                user.loginAttempts += 1;
+                if (user.loginAttempts >= 5) {
+                    user.lockUntil = Date.now() + 30 * 60000; // Lock for 30 minutes
+                }
+                await user.save();
                 throw new Error("Invalid credentials");
+            }
+
+            // Reset login attempts on successful login
+            if (user.loginAttempts > 0 || user.lockUntil) {
+                user.loginAttempts = 0;
+                user.lockUntil = undefined;
+                await user.save();
             }
         }
 

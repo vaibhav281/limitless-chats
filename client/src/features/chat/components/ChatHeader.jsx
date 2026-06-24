@@ -2,7 +2,7 @@ import React from 'react';
 import { Box, Typography, Avatar, IconButton, Badge } from '@mui/material';
 import KeyboardArrowLeftIcon from '@mui/icons-material/KeyboardArrowLeft';
 
-export default function ChatHeader({ chatWithId, setChatWithId, activeUsers, conversations = [] }) {
+const ChatHeader = React.memo(function ChatHeader({ chatWithId, setChatWithId, activeUsers, conversations = [] }) {
   if (!chatWithId) return null;
 
   let displayName = activeUsers.find(u => u.userId === chatWithId)?.username;
@@ -40,4 +40,6 @@ export default function ChatHeader({ chatWithId, setChatWithId, activeUsers, con
         </Typography>
     </Box>
   );
-}
+});
+
+export default ChatHeader;

@@ -202,7 +202,19 @@ router.delete("/:id", async (req, res) => {
       await note.save();
 
       const populatedNote = await Note.findById(note._id).populate("replyTo");
-      if (req.io) req.io.emit("noteUpdated", populatedNote);
+      if (req.io && req.userSockets) {
+        if (note.receiverId === "global_group") {
+          req.io.emit("noteUpdated", populatedNote);
+        } else {
+          const receiverSocketId = req.userSockets.get(note.receiverId);
+          if (receiverSocketId) req.io.to(receiverSocketId).emit("noteUpdated", populatedNote);
+          
+          const senderSocketId = req.userSockets.get(note.senderId);
+          if (senderSocketId && senderSocketId !== receiverSocketId) {
+            req.io.to(senderSocketId).emit("noteUpdated", populatedNote);
+          }
+        }
+      }
       return res.json({ success: true, note: populatedNote });
     }
 
@@ -235,7 +247,13 @@ router.post("/delete-multiple", async (req, res) => {
       { $addToSet: { deletedForUsers: userId } }
     );
 
-    res.json({ success: true, forMeOnly: true });
+    res.json({ success: true, forMeOnly: deleteType === 'for_me' });
+
+    // Sync deletes if for everyone (Broadcast globally for now for bulk, or target if needed)
+    if (deleteType === 'for_everyone' && req.io) {
+       // Since bulk delete for everyone is rare/unsupported in UI currently, we broadcast to be safe
+       req.io.emit("bulkDelete", { ids, userId }); 
+    }
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -311,7 +329,19 @@ router.put("/:id", async (req, res) => {
 
     const populatedNote = await Note.findById(note._id).populate("replyTo");
 
-    if (req.io) req.io.emit("noteUpdated", populatedNote);
+    if (req.io && req.userSockets) {
+      if (note.receiverId === "global_group") {
+        req.io.emit("noteUpdated", populatedNote);
+      } else {
+        const receiverSocketId = req.userSockets.get(note.receiverId);
+        if (receiverSocketId) req.io.to(receiverSocketId).emit("noteUpdated", populatedNote);
+        
+        const senderSocketId = req.userSockets.get(note.senderId);
+        if (senderSocketId && senderSocketId !== receiverSocketId) {
+          req.io.to(senderSocketId).emit("noteUpdated", populatedNote);
+        }
+      }
+    }
     res.json(populatedNote);
   } catch (err) {
     res.status(500).json({ error: err.message });

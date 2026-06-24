@@ -117,10 +117,24 @@ Server → sets `isDeletedForEveryone = true`
 CLEAR: `noteText = ""`, `ciphertextEdit = ""`, `plaintextEdit = ""`, `attachments = []`.
 UI: "This message was deleted".
 
-## PART 5 — FUTURE-PROOF ARCHITECTURE CODEC
-1. **No blind changes**: Every change must trace Server → Socket → Cache → UI.
-2. **No assumption coding**: Never assume a field exists. Always validate schema.
-3. **No direct state mutation**: Always use reducer/merge logic.
-4. **Define authority**: Every new feature must explicitly define Source of truth, Sync mechanism, and Conflict resolution before code is written.
-5. **E2EE pipeline is LOCKED**: ❌ DO NOT TOUCH encryption logic. Only handle *when* to decrypt and *when* to ignore cache.
-6. **All sync must be deterministic**: Same Input → Same Output on every device.
+## PART 6 — CHAT SESSION & NAVIGATION RULES (WHATSAPP-STYLE)
+To prevent flickering, session loss on mobile, and "dual source of truth" conflicts, the following rules are strictly enforced:
+
+🚫 **RULE 13 — SINGLE SOURCE OF CHAT TRUTH**
+`chatWithId` (React State) is the ONLY authority for the active conversation. 
+- **NO** `useSearchParams` or URL-based chat switching.
+- **NO** bi-directional sync with the address bar.
+
+🚫 **RULE 14 — NO AUTOMATIC RESETS**
+`chatWithId` MUST NEVER be reset to `null` automatically by any background process (Socket reconnect, upload cycle, sidebar re-render). 
+- It can ONLY be changed by explicit user interaction (Sidebar click).
+
+🚫 **RULE 15 — PERSISTENCE IS ONE-WAY**
+Stable initialization is performed via `localStorage.getItem("lastChat")` only on mount. 
+- Updates flow: `User Click → State Change → LocalStorage Write`.
+- The URL bar remains stable and is NOT used as a state bridge.
+
+🚫 **RULE 16 — CONTAINER STABILITY**
+The main Chat Container MUST stay mounted. Component swapping (Chat vs EmptyState) must occur inside the container to prevent full-page mount/unmount flickers.
+- Use stable `key={chatWithId}` on sub-components if necessary, but keep the parent layout static.
+

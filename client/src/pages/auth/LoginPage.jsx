@@ -3,6 +3,7 @@ import { Box, Paper, TextField, Button, Typography, CircularProgress, Link as Mu
 import { Link, useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import { generateAndUploadKeys, signalStore } from '../../features/encryption/keyManager';
+import PasswordField from '../../components/common/PasswordField';
 
 export default function LoginPage() {
     const [formData, setFormData] = useState({ email: '', password: '' });
@@ -68,11 +69,10 @@ export default function LoginPage() {
                         InputLabelProps={{ style: { color: '#8696a0' } }}
                         sx={{ input: { color: '#e9edef' }, '& .MuiOutlinedInput-root': { '& fieldset': { borderColor: '#2a3942' }, '&:hover fieldset': { borderColor: '#00a884' }, '&.Mui-focused fieldset': { borderColor: '#00a884' } } }}
                     />
-                    <TextField
-                        fullWidth label="Password" name="password" type="password" variant="outlined" margin="normal" required
+                    
+                    <PasswordField
+                        label="Password" name="password" required
                         value={formData.password} onChange={handleChange}
-                        InputLabelProps={{ style: { color: '#8696a0' } }}
-                        sx={{ input: { color: '#e9edef' }, '& .MuiOutlinedInput-root': { '& fieldset': { borderColor: '#2a3942' }, '&:hover fieldset': { borderColor: '#00a884' }, '&.Mui-focused fieldset': { borderColor: '#00a884' } } }}
                     />
                     
                     <Button

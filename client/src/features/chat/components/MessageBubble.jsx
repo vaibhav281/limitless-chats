@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { Box, Paper, Typography, IconButton, Button, CircularProgress } from '@mui/material';
+import { Box, Paper, Typography, IconButton, Button, CircularProgress, useMediaQuery } from '@mui/material';
 import '../styles/chat-theme.css';
 import '../styles/message-bubble.css';
 import FileDownloadIcon from '@mui/icons-material/FileDownload';
@@ -53,7 +53,8 @@ const MessageBubble = React.forwardRef(({
   retryTask,
   currentUser,
   onRightClick,
-  isPinned
+  isPinned,
+  isFirstInGroup = false
 }, ref) => {
   const [touchStart, setTouchStart] = useState(null);
   const [touchTimer, setTouchTimer] = useState(null);
@@ -204,19 +205,55 @@ const MessageBubble = React.forwardRef(({
     return null;
   };
 
+  const renderMetadataRow = (isOverlay = false) => {
+    const task = fileProgress && fileProgress[note._id];
+    const isPending = task && (task.status === 'uploading' || task.status === 'encrypting');
+    const isFailed = (task && task.status === 'failed') || note.permanentlyFailed;
+
+    const StatusIcon = () => {
+      if (isPending) return <CircularProgress size={12} sx={{ color: isOverlay ? '#fff' : '#8696a0' }} />;
+      if (isFailed) return <ErrorOutlineIcon sx={{ fontSize: 14, color: '#f15c6d' }} />;
+      if (note.isRead || note.status === 'seen') return <DoneAllIcon sx={{ fontSize: 14, color: '#53bdeb' }} />;
+      const iconColor = isOverlay ? '#fff' : '#8696a0';
+      if (note.status === 'delivered') return <DoneAllIcon sx={{ fontSize: 14, color: iconColor }} />;
+      return <CheckIcon sx={{ fontSize: 14, color: iconColor }} />;
+    };
+
+    return (
+      <Box className={isOverlay ? "msg-media-meta" : "msg-meta"}>
+        {isPinned && !isOverlay && (
+          <PushPinIcon sx={{ fontSize: 13, mr: 0.5, color: isSentByMe ? '#aebac1' : '#8696a0', transform: 'rotate(45deg)' }} />
+        )}
+        {note.isEdited && !note.isDeletedForEveryone && (
+          <Box component="span" sx={{ fontSize: '0.65rem', fontStyle: 'italic', opacity: 0.7, mr: 0.5 }}>edited</Box>
+        )}
+        {dayjs(note.timestamp).format("h:mm A")}
+        {isSentByMe && (
+          <Box component="span" sx={{ ml: 0.5, display: 'flex', alignItems: 'center' }}>
+            <StatusIcon />
+          </Box>
+        )}
+      </Box>
+    );
+  };
+
   const renderMediaGrid = (items, isFirst) => {
     if (!items.length) return null;
-    const extraCount = Math.max(0, items.length - 4);
-    const displayItems = items.slice(0, 4);
-    const isSingle = displayItems.length === 1;
-    const count = displayItems.length;
+    const isMobile = useMediaQuery('(max-width:600px)');
+    const isTablet = useMediaQuery('(max-width:960px)');
 
-    // WhatsApp-style grid: 1 = full width, 2 = side by side, 3 = 1 top + 2 bottom, 4 = 2x2
+    const displayCount = 4;
+    const displayItems = items.slice(0, displayCount);
+    const extraCount = Math.max(0, items.length - displayCount);
+    const count = displayItems.length;
+    const isSingle = count === 1;
+
+    // WhatsApp-style grid (STRICT 2x2 cap with +X overlay)
     const getGridTemplate = () => {
       if (isSingle) return { columns: '1fr', rows: 'auto' };
       if (count === 2) return { columns: '1fr 1fr', rows: 'auto' };
       if (count === 3) return { columns: '1fr 1fr', rows: 'auto auto' };
-      return { columns: '1fr 1fr', rows: '1fr 1fr' }; // 4 items = 2x2
+      return { columns: '1fr 1fr', rows: '1fr 1fr' }; // Strict 2x2 cap
     };
 
     const grid = getGridTemplate();
@@ -243,8 +280,8 @@ const MessageBubble = React.forwardRef(({
                                 aspectRatio: isSingle 
                                     ? (att.type === 'video' || classifyFile(att) === FILE_TYPES.VIDEO ? '16 / 9' : 'auto') 
                                     : '1 / 1',
-                                maxHeight: isSingle ? 400 : 200,
-                                minHeight: isSingle && (att.type === 'video' || classifyFile(att) === FILE_TYPES.VIDEO) ? 180 : (isSingle ? 'auto' : 100),
+                                maxHeight: isSingle ? 400 : (count > 9 ? 120 : (count > 4 ? 160 : 220)),
+                                minHeight: isSingle && (att.type === 'video' || classifyFile(att) === FILE_TYPES.VIDEO) ? 180 : (isSingle ? 'auto' : 80),
                                 ...(spanFull && { gridColumn: '1 / -1', aspectRatio: '16 / 9', maxHeight: 220 }),
                                 '&:hover': { opacity: 0.92 }
                             }} 
@@ -257,9 +294,13 @@ const MessageBubble = React.forwardRef(({
                                 isSentByMe={isSentByMe}
                                 isSingle={isSingle}
                                 isThreeGridFirst={spanFull}
+                                index={originalIdx}
                                 extraCount={idx === displayItems.length - 1 ? extraCount : 0} 
                                 isThumbnail={true}
                             />
+                            
+                            {/* Metadata Overlay for Media */}
+                            {renderMetadataRow(true)}
                             
                             {/* WhatsApp-Style Floating Download Button for Media */}
                             {att._isReady && (
@@ -356,40 +397,34 @@ const MessageBubble = React.forwardRef(({
 
   const renderFileRow = (att, isFirst) => {
       return (
-          <Box key={att.id || `file-${att.fileName}`} className="msg-file">
+          <Box key={att.id || `file-${att.fileName}`} className="msg-file-card">
               <Box className="msg-file-info">
                   <Box sx={{ 
-                      width: 42, height: 42, borderRadius: '50%', 
+                      width: 42, height: 42, borderRadius: 2, 
                       bgcolor: getIconBg(att), 
                       display: 'flex', alignItems: 'center', justifyContent: 'center',
                       flexShrink: 0
                   }}>
                       {getFileIcon(att)}
                   </Box>
-                  <Box sx={{ flex: 1, minWidth: 0, overflow: 'hidden' }}>
-                      <Typography variant="body2" noWrap sx={{ fontWeight: 500, color: 'var(--text-primary)', fontSize: '0.875rem', lineHeight: 1.3 }}>
+                  <Box sx={{ flex: 1, minWidth: 0, overflow: 'hidden', pr: 8 }}>
+                      <Typography variant="body2" noWrap sx={{ fontWeight: 500, color: 'var(--text-primary)', fontSize: '0.875rem' }}>
                           {att.fileName || att.originalName}
                       </Typography>
                       <Typography variant="caption" sx={{ color: 'var(--text-secondary)', fontSize: '0.7rem' }}>
                           {getFileExt(att)} • {att.size ? formatBytes(att.size) : ''}
                       </Typography>
                   </Box>
+                  {/* Integrated Metadata for File Card */}
+                  <Box className="msg-file-metadata">
+                     {renderMetadataRow(false)}
+                  </Box>
               </Box>
               <Box className="msg-file-actions">
-                  <Box 
-                      onClick={(e) => {
-                          e.stopPropagation();
-                          downloadFile(att.url, att.fileName || att.originalName, att.binaryAesKey ? { aesKey: att.binaryAesKey, iv: att.binaryIv, mimeType: att.mimeType || att.originalMimeType || att.type } : null);
-                      }}
-                  >
+                  <Box onClick={(e) => { e.stopPropagation(); downloadFile(att.url, att.fileName || att.originalName, att.binaryAesKey ? { aesKey: att.binaryAesKey, iv: att.binaryIv, mimeType: att.mimeType || att.originalMimeType || att.type } : null); }}>
                       Open
                   </Box>
-                  <Box 
-                      onClick={(e) => {
-                          e.stopPropagation();
-                          downloadFile(att.url, att.fileName || att.originalName, att.binaryAesKey ? { aesKey: att.binaryAesKey, iv: att.binaryIv, mimeType: att.mimeType || att.originalMimeType || att.type } : null);
-                      }}
-                  >
+                  <Box onClick={(e) => { e.stopPropagation(); downloadFile(att.url, att.fileName || att.originalName, att.binaryAesKey ? { aesKey: att.binaryAesKey, iv: att.binaryIv, mimeType: att.mimeType || att.originalMimeType || att.type } : null); }}>
                       Save as...
                   </Box>
               </Box>
@@ -456,6 +491,10 @@ const MessageBubble = React.forwardRef(({
       );
   }
 
+  const hasText = !!displayText;
+  const hasFiles = fileAttachments.length > 0;
+  const hasMedia = mediaAttachments.length > 0;
+
   return (
     <Box 
       id={note._id}
@@ -466,9 +505,11 @@ const MessageBubble = React.forwardRef(({
          width: "100%", 
          boxSizing: "border-box",
          py: 0.5, px: { xs: 1, sm: 2 },
+         position: 'relative',
          transform: `translateX(${swipeOffset}px)`,
          transition: touchStart ? 'none' : 'transform 0.2s',
-         bgcolor: isSelected ? "rgba(0,168,132,0.2)" : "transparent"
+         bgcolor: isSelected ? "rgba(0,168,132,0.2)" : "transparent",
+         '&:hover .msg-forward-btn': { opacity: 1 }
       }}
       onClick={() => onPress(note)}
       onMouseEnter={() => setIsHovered(true)}
@@ -482,17 +523,29 @@ const MessageBubble = React.forwardRef(({
           else if (onLongPress) onLongPress(note);
       }}
     >
-      {/* Desktop Hover Actions */}
-      {isHovered && (
-        <Box sx={{ position: "absolute", [isSentByMe ? 'right' : 'left']: "100%", [isSentByMe ? 'mr' : 'ml']: 1, top: "50%", transform: "translateY(-50%)", display: { xs: 'none', md: 'flex' }, gap: 0.5, zIndex: 10 }}>
-          <IconButton size="small" sx={{ bgcolor: "rgba(0,0,0,0.3)", color: "#aebac1", '&:hover': { bgcolor: "rgba(0,0,0,0.6)", color: "#e9edef" } }} onClick={(e) => { e.stopPropagation(); onSwipeRight(note); }}>
-            <ReplyIcon fontSize="small" sx={{ transform: "scaleX(-1)" }} />
-          </IconButton>
-        </Box>
-      )}
+      {/* WhatsApp Forward Icon (Visible on hover) */}
+      <Box className="msg-forward-btn" sx={{ 
+        position: 'absolute', 
+        [isSentByMe ? 'right' : 'left']: '100%', 
+        [isSentByMe ? 'marginRight' : 'marginLeft']: 1.5,
+        top: '50%', transform: 'translateY(-50%)',
+        opacity: 0, transition: 'opacity 0.2s',
+        display: { xs: 'none', md: 'flex' }
+      }}>
+        <IconButton size="small" sx={{ bgcolor: 'rgba(255,255,255,0.05)', color: '#aebac1', '&:hover': { bgcolor: 'rgba(255,255,255,0.1)', color: '#fff' } }}>
+           <ReplyIcon sx={{ transform: 'scaleX(-1)', fontSize: 20 }} />
+        </IconButton>
+      </Box>
 
-      <Paper className={`msg-bubble ${isSentByMe ? 'out' : 'in'} ${isSelected ? 'selected' : ''}`}>
-        {/* Sender Name */}
+      <Paper 
+        className={`msg-bubble ${isSentByMe ? 'out' : 'in'} ${isSelected ? 'selected' : ''} ${isFirstInGroup ? 'has-tail' : ''}`}
+        sx={{
+          border: isPinned ? `1px solid ${isSentByMe ? '#00a884' : 'rgba(134,150,160,0.5)'}` : 'none',
+          bgcolor: isPinned ? (isSentByMe ? '#054740' : '#26353d') : bubbleColor, // subtle shift for pinned
+          boxShadow: isPinned ? `0 0 8px ${isSentByMe ? 'rgba(0,168,132,0.2)' : 'rgba(134,150,160,0.2)'}` : '0 1px 0.5px rgba(0,0,0,0.13)'
+        }}
+      >
+        {/* Sender Name (Group only) */}
         {!isSentByMe && senderName !== "Anonymous" && note.isGroup && (
            <Typography variant="caption" sx={{ color: getUserColor(note.senderId), fontWeight: 'bold', display: 'block', mb: 0.5, px: 'var(--bubble-padding-x)', pt: '8px' }}>
               {senderName}
@@ -514,6 +567,7 @@ const MessageBubble = React.forwardRef(({
               </Typography>
            </Box>
         )}
+
         {/* Message Content Stream (Unified Surface) */}
         <Box className="msg-content">
             {unifiedContent.map((item, i) => {
@@ -532,57 +586,8 @@ const MessageBubble = React.forwardRef(({
             </Box>
         )}
 
-        {/* Timestamp & Status */}
-        <Box className="msg-meta">
-              <Typography 
-                variant="caption" 
-                sx={{ 
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 0.5
-                }}
-              >
-                {isPinned && <PushPinIcon sx={{ fontSize: "14px", mr: 0.5, color: "#8696a0" }} />}
-                {note.isEdited && !note.isDeletedForEveryone && (
-                    <Box component="span" sx={{ fontSize: '0.6rem', fontStyle: 'italic', opacity: 0.85, mr: 0.3 }}>edited</Box>
-                )}
-                {dayjs(note.timestamp).format("h:mm A")}
-                {isSentByMe && (
-                  <Box component="span" sx={{ display: 'flex', alignItems: 'center', ml: 0.5 }}>
-                    {(() => {
-                        const task = fileProgress && fileProgress[note._id];
-                        const isPending = task && (task.status === 'uploading' || task.status === 'encrypting');
-                        const isFailed = (task && task.status === 'failed') || note.permanentlyFailed;
-
-                        if (isPending) {
-                            return <CircularProgress size={14} sx={{ color: '#8696a0', ml: 0.5 }} />;
-                        }
-                        if (isFailed) {
-                            return (
-                                <IconButton 
-                                    size="small" 
-                                    sx={{ p: 0, ml: 0.5, color: '#f15c6d' }} 
-                                    onClick={(e) => { e.stopPropagation(); if (retryTask) retryTask(note._id); }}
-                                    title="Retry Send"
-                                >
-                                    <ErrorOutlineIcon sx={{ fontSize: 16 }} />
-                                </IconButton>
-                            );
-                        }
-                        
-                        // Normal Done States (task sent or cleared)
-                        if (note.isRead || note.status === 'seen') {
-                           return <DoneAllIcon sx={{ fontSize: 14, color: '#53bdeb' }} />;
-                        }
-                        if (note.status === 'delivered') {
-                           return <DoneAllIcon sx={{ fontSize: 14, color: '#8696a0' }} />;
-                        }
-                        return <CheckIcon sx={{ fontSize: 14, color: '#8696a0' }} />;
-                    })()}
-                  </Box>
-                )}
-              </Typography>
-        </Box>
+        {/* Bottom Metadata (Only if text is present. Media/Files have their own) */}
+        {(hasText || (!hasMedia && !hasFiles)) && renderMetadataRow(false)}
       </Paper>
     </Box>
   );
@@ -606,5 +611,9 @@ export default React.memo(MessageBubble, (prevProps, nextProps) => {
                      prevReply?.isDeletedForEveryone === nextReply?.isDeletedForEveryone;
     }
 
-    return isNoteSame && isReplySame && prevProps.isSelected === nextProps.isSelected;
+    return isNoteSame && 
+           isReplySame && 
+           prevProps.isSelected === nextProps.isSelected && 
+           prevProps.isPinned === nextProps.isPinned &&
+           prevProps.isFirstInGroup === nextProps.isFirstInGroup;
 });

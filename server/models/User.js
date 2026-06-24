@@ -26,6 +26,13 @@ const userSchema = new mongoose.Schema(
         providerId: {
             type: String,
             // For future Firebase User UID mapping
+        },
+        loginAttempts: {
+            type: Number,
+            default: 0
+        },
+        lockUntil: {
+            type: Date
         }
     },
     { timestamps: true }

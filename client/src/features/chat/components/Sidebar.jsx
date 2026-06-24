@@ -13,7 +13,7 @@ import isYesterday from "dayjs/plugin/isYesterday";
 dayjs.extend(isToday);
 dayjs.extend(isYesterday);
 
-export default function Sidebar({ chatWithId, setChatWithId, activeUsers, userId, unreadCounts = {}, conversations = [] }) {
+const Sidebar = React.memo(function Sidebar({ chatWithId, setChatWithId, activeUsers, userId, unreadCounts = {}, conversations = [] }) {
   const navigate = useNavigate();
   const username = localStorage.getItem("username") || "User";
 
@@ -314,4 +314,6 @@ export default function Sidebar({ chatWithId, setChatWithId, activeUsers, userId
        </Box>
     </Box>
   );
-}
+});
+
+export default Sidebar;

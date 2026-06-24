@@ -2,7 +2,7 @@ import React, { useEffect, useState, useRef, useCallback, useMemo } from "react"
 import useNotes from "../hooks/useNotes";
 import useFileUpload from "../hooks/useFileUpload";
 import useEncryptedMessaging from "../hooks/useEncryptedMessaging";
-import { Box, Paper, IconButton, Typography, Modal, TextField, Button, Dialog, Fade, Fab } from "@mui/material";
+import { Box, Paper, IconButton, Typography, Modal, TextField, Button, Dialog, Fade, Fab, CircularProgress } from "@mui/material";
 import { saveMessageLocally } from "../features/encryption/localMessageStore";
 import { mediaKeyCache } from "../features/encryption/mediaKeyCache";
 import InfiniteScroll from "react-infinite-scroll-component";
@@ -59,10 +59,48 @@ export default function DailyNotesPage() {
     else setShowNamePrompt(true);
   }, []);
 
-  const [chatWithId, setChatWithId] = useState(null);
+  const [chatWithId, setChatWithId] = useState(() => localStorage.getItem("lastChat") || null);
+  const [activePinIndex, setActivePinIndex] = useState(0);
+  
   const { notes, setNotes, loadLatest, loadOlder, addNote, deleteNote, deleteMany, pinNote, unpinNote, hasMore, fetchNotes, activeUsers, userId, editNote, unreadCounts, setUnreadCounts, conversations, socket, cacheSentMessage, pinnedMessageIds } = useNotes(20, chatWithId, username);
   const { fileProgress, uploadFiles, downloadFile, cancelTask, retryTask } = useFileUpload();
-  const { encryptOutgoing } = useEncryptedMessaging(userId);
+  const { encryptOutgoing, isKeysReady } = useEncryptedMessaging(userId);
+
+  // Derive active pinned messages (Robust Mapping)
+  const pinnedMessages = useMemo(() => {
+    const map = new Map(notes.map(n => [n._id, n]));
+    return Array.from(pinnedMessageIds)
+      .map(id => map.get(id))
+      .filter(Boolean)
+      .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+  }, [notes, pinnedMessageIds]);
+
+  // Reset index if pins change or become fewer
+  useEffect(() => {
+    if (activePinIndex >= pinnedMessages.length) {
+      setActivePinIndex(0);
+    }
+  }, [pinnedMessages.length, activePinIndex]);
+
+  const scrollToMessage = useCallback((id) => {
+    const el = document.getElementById(id);
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      // Add a brief highlight effect
+      el.style.backgroundColor = "rgba(0,168,132,0.3)";
+      setTimeout(() => {
+        el.style.backgroundColor = "transparent";
+      }, 1500);
+    }
+  }, []);
+
+  // One-way Persistence (State -> LocalStorage)
+  useEffect(() => {
+    if (chatWithId) {
+      localStorage.setItem("lastChat", chatWithId);
+      console.log("[DailyNotes] Persisted Chat ID:", chatWithId);
+    }
+  }, [chatWithId]);
 
   const handleSaveName = (name) => {
     if (!name.trim()) return;
@@ -545,15 +583,37 @@ export default function DailyNotesPage() {
       return isMine && hasNoAttachments && isNotDeleted && isUnder15Mins;
   })();
 
+  // Final Security Guard: Ensure we are fully identified (Token + Keys)
+  if (!userId) return null; // ProtectedRoute should handle this, but safety first
+  
+  if (!isKeysReady) {
+    return (
+      <Box sx={{ height: '100vh', display: "flex", justifyContent: "center", alignItems: "center", flexDirection: "column", bgcolor: "#111b21" }}>
+          <CircularProgress size={48} sx={{ color: "#00a884", mb: 2 }} />
+          <Typography sx={{ color: "#8696a0" }}>Securing Connection...</Typography>
+      </Box>
+    );
+  }
+
+  // Debug Trap for State Switches
+  console.log("[DailyNotes] Rendering with Chat ID:", chatWithId);
+
   return (
     <Box sx={{ flex: 1, display: "flex", height: "100%", overflow: "hidden", position: "relative" }}>
       <Sidebar chatWithId={chatWithId} setChatWithId={setChatWithId} activeUsers={activeUsers} userId={userId} unreadCounts={unreadCounts} conversations={conversations} />
 
-      {/* Main Chat Area */}
-      <Box sx={{ flex: 1, display: { xs: chatWithId ? "flex" : "none", sm: "flex" }, flexDirection: "column", position: "relative" }}>
+      {/* Main Chat Area Container (Stays Mounted) */}
+      <Box sx={{ 
+        flex: 1, 
+        display: { xs: chatWithId ? "flex" : "none", sm: "flex" }, 
+        flexDirection: "column", 
+        position: "relative",
+        bgcolor: "#0b141a" // Stable background
+      }}>
          {chatWithId ? (
-            <ErrorBoundary>
-              <ChatHeader chatWithId={chatWithId} setChatWithId={setChatWithId} activeUsers={activeUsers} conversations={conversations} />
+            <React.Fragment key={chatWithId}>
+              <ErrorBoundary>
+                <ChatHeader chatWithId={chatWithId} setChatWithId={setChatWithId} activeUsers={activeUsers} conversations={conversations} />
               
               {/* Action Bar (Replaces Header when selecting messages) */}
               <Fade in={showActionBar}>
@@ -569,6 +629,70 @@ export default function DailyNotesPage() {
                   </Box>
                 </Paper>
               </Fade>
+
+              {/* Pinned Messages Bar (WhatsApp V2: Multi-Pin Navigation) */}
+              {pinnedMessages.length > 0 && pinnedMessages[activePinIndex] && (
+                <Box 
+                  sx={{ 
+                    bgcolor: "#202c33", 
+                    px: 2, py: 1, 
+                    borderBottom: "1px solid rgba(255,255,255,0.05)",
+                    display: "flex", alignItems: "center", gap: 1,
+                    zIndex: 5,
+                  }}
+                >
+                  <PushPinIcon sx={{ fontSize: 16, color: "#00a884", transform: 'rotate(45deg)' }} />
+
+                  {/* LEFT NAV */}
+                  {pinnedMessages.length > 1 && (
+                    <IconButton
+                      size="small"
+                      sx={{ color: "#8696a0" }}
+                      disabled={activePinIndex === 0}
+                      onClick={(e) => { e.stopPropagation(); setActivePinIndex(i => Math.max(0, i - 1)); }}
+                    >
+                      <KeyboardArrowLeftIcon fontSize="small" />
+                    </IconButton>
+                  )}
+
+                  {/* MESSAGE CONTENT (Click -> Jump) */}
+                  <Box 
+                    sx={{ flex: 1, minWidth: 0, cursor: "pointer" }}
+                    onClick={() => scrollToMessage(pinnedMessages[activePinIndex]?._id)}
+                  >
+                    <Typography variant="caption" sx={{ color: "#00a884", fontWeight: 600, display: "block", lineHeight: 1 }}>
+                      Pinned {activePinIndex + 1} of {pinnedMessages.length}
+                    </Typography>
+                    <Typography noWrap variant="body2" sx={{ color: "#e9edef", mt: 0.5, fontSize: "0.85rem" }}>
+                      {pinnedMessages[activePinIndex]?.plaintextEdit || pinnedMessages[activePinIndex]?.noteText || (pinnedMessages[activePinIndex]?.attachments?.length ? "Media/File" : "Message")}
+                    </Typography>
+                  </Box>
+
+                  {/* RIGHT NAV */}
+                  {pinnedMessages.length > 1 && (
+                    <IconButton
+                      size="small"
+                      sx={{ color: "#8696a0" }}
+                      disabled={activePinIndex === pinnedMessages.length - 1}
+                      onClick={(e) => { e.stopPropagation(); setActivePinIndex(i => Math.min(pinnedMessages.length - 1, i + 1)); }}
+                    >
+                      <KeyboardArrowRightIcon fontSize="small" />
+                    </IconButton>
+                  )}
+
+                  {/* UNPIN BUTTON */}
+                  <IconButton 
+                    size="small"
+                    sx={{ color: "#8696a0", '&:hover': { color: "#f15c6d" } }} 
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      unpinNote(pinnedMessages[activePinIndex]?._id);
+                    }}
+                  >
+                    <CloseIcon fontSize="small" />
+                  </IconButton>
+                </Box>
+              )}
 
               <Box 
                 id="scrollableDiv" 
@@ -601,6 +725,11 @@ export default function DailyNotesPage() {
                           showDateSeparator = true;
                         }
                       }
+
+                      // Logic for WhatsApp-style tails: only the first message in a group gets a tail
+                      const isFirstInGroup = !olderNote || 
+                                             olderNote.senderId !== note.senderId || 
+                                             showDateSeparator;
 
                       let dateLabel = "";
                       if (showDateSeparator) {
@@ -647,6 +776,7 @@ export default function DailyNotesPage() {
                             retryTask={handleRetryTask}
                             currentUser={{ username }}
                             onRightClick={handleRightClick}
+                            isFirstInGroup={isFirstInGroup}
                             isPinned={pinnedMessageIds.has(note._id)}
                           />
                         </React.Fragment>
@@ -676,13 +806,20 @@ export default function DailyNotesPage() {
                  </Fab>
               </Fade>
 
-              {/* Bottom Input */}
-              <input type="file" ref={fileInputRef} hidden multiple accept="image/*,video/*,audio/*,application/pdf" onChange={handleFileSelect} />
+              {/* Hidden File Inputs (separated by type for attachment menu) */}
+              <input type="file" ref={fileInputRef} hidden multiple accept="*/*" onChange={handleFileSelect} />
+              <input type="file" id="gallery-input" hidden multiple accept="image/*,video/*" onChange={handleFileSelect} />
+              <input type="file" id="document-input" hidden multiple accept="application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/*,application/zip,application/x-rar-compressed,application/x-7z-compressed,.doc,.docx,.xls,.xlsx,.csv,.txt,.zip,.rar,.7z,.pptx,.ppt,.json,.html,.css,.js,.py,.java,.cpp,.c,.xml,.yaml,.yml,.md,.log,.ini,.cfg,.env,.sh,.bat" onChange={handleFileSelect} />
+              <input type="file" id="audio-input" hidden multiple accept="audio/*" onChange={handleFileSelect} />
               <ChatInput 
                 inputRef={inputRef}
                 handleSend={handleSend}
                 handleKeyDown={handleKeyDown}
                 handleAttachmentClick={() => fileInputRef.current?.click()}
+                onCameraClick={() => setCameraOpen(true)}
+                onGalleryClick={() => document.getElementById('gallery-input')?.click()}
+                onDocumentClick={() => document.getElementById('document-input')?.click()}
+                onAudioClick={() => document.getElementById('audio-input')?.click()}
                 replyingTo={replyingTo}
                 setReplyingTo={setReplyingTo}
                 editingNote={editingNote}
@@ -711,6 +848,7 @@ export default function DailyNotesPage() {
                 </Box>
               </Dialog>
             </ErrorBoundary>
+          </React.Fragment>
          ) : (
             <Box sx={{ flex: 1, display: "flex", justifyContent: "center", alignItems: "center", flexDirection: "column", bgcolor: "#202c33", borderBottom: "6px solid #00a884" }}>
                 <img src="/chat_app.svg" alt="Limitless Chats Logo" style={{ width: 140, height: 140, marginBottom: 24, opacity: 0.9 }} />

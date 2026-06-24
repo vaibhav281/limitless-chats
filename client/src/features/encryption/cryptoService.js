@@ -113,30 +113,33 @@ export const decryptFile = async (ciphertextBlob, aesKeyInput, ivInput, original
  * 3. Attachment UUID ('attachmentId')
  * 4. File Index ('fileIndex')
  */
+/**
+ * Resolves a stable ID for an attachment. 
+ * PRIORITIES (Strictly aligned with useNotes.js): 
+ * 1. id (Server-generated)
+ * 2. _id (Database ID)
+ * 3. clientId (Temp frontend ID)
+ * 4. fileHash (Content-based)
+ * 5. idx_${indexFallback} (Last resort index fallback)
+ */
 export function getEffectiveAttachmentId(attachment, indexFallback = 0) {
-    if (!attachment) return `unknown_${indexFallback}`;
+    if (!attachment) return `idx_${indexFallback}`;
 
-    // 1. Explicit File Hash
-    if (attachment.fileHash) return attachment.fileHash;
-
-    // 2. Canonical id
-    if (attachment.id) return attachment.id;
-
-    // 3. Client-generated UUID
-    if (attachment.attachmentId) return attachment.attachmentId;
-
-    // 4. File Index (from Signal, for attachments in a message)
-    if (attachment.fileIndex !== undefined) return attachment.fileIndex;
-    if (attachment.index !== undefined) return attachment.index;
-
-    return `unknown_${indexFallback}`;
+    return (
+        attachment.id || 
+        attachment._id || 
+        attachment.clientId || 
+        attachment.fileHash || 
+        (attachment.fileIndex !== undefined ? attachment.fileIndex : 
+         (attachment.index !== undefined ? attachment.index : `idx_${indexFallback}`))
+    );
 }
 
 export function getBlobCacheKey(noteId, attachment, index = 0) {
-  if (attachment?.fileHash) return attachment.fileHash;
-  if (attachment?.id) return attachment.id;
-  if (attachment?.attachmentId) return attachment.attachmentId;
-  return `${noteId}_${index}`;
+  const stableId = getEffectiveAttachmentId(attachment, index);
+  // If the ID is globally unique (not an index fallback), use it directly
+  if (typeof stableId === 'string' && !stableId.startsWith('idx_')) return stableId;
+  return `${noteId}_${stableId}`;
 }
 
 /**

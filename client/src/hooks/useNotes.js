@@ -396,10 +396,11 @@ export default function useNotes(initialLimit = 20, chatWithId = null, username 
 
         // Save SENDER media keys directly to DB so refresh doesn't break DecryptedMedia!
         if (finalOptimisticNote.attachments && finalOptimisticNote.attachments.length > 0) {
+          const { getEffectiveAttachmentId } = await import("../features/encryption/cryptoService");
           for (const [idx, att] of finalOptimisticNote.attachments.entries()) {
             if (att.binaryAesKey) {
-              const attachId = att.attachmentId || (att.fileIndex !== undefined ? att.fileIndex : idx);
-              await mediaKeyCache.saveMediaKey(userId, finalOptimisticNote._id, attachId, {
+              const stableId = getEffectiveAttachmentId(att, idx);
+              await mediaKeyCache.saveMediaKey(userId, finalOptimisticNote._id, stableId, {
                 aesKey: att.binaryAesKey
               });
               delete att.binaryAesKey;
@@ -503,8 +504,15 @@ export default function useNotes(initialLimit = 20, chatWithId = null, username 
       await pinNoteAPI(id, userId);
       setPinnedMessageIds(prev => {
         const next = new Set(prev);
-        next.add(id);
-        return next;
+        if (!next.has(id)) {
+          if (next.size >= 3) {
+            // Enforce 3-pin limit locally (FIFO)
+            const oldestId = next.values().next().value;
+            next.delete(oldestId);
+          }
+          next.add(id);
+        }
+        return new Set(next);
       });
     } catch(err) { console.error(err); }
   }, [userId]);
@@ -515,7 +523,7 @@ export default function useNotes(initialLimit = 20, chatWithId = null, username 
       setPinnedMessageIds(prev => {
          const next = new Set(prev);
          next.delete(id);
-         return next;
+         return new Set(next);
       });
     } catch(err) { console.error(err); }
   }, [userId]);

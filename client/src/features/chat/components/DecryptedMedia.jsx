@@ -18,16 +18,29 @@ const DecryptedMedia = React.memo(function DecryptedMedia({
   isSingle, 
   isThreeGridFirst, 
   extraCount,
+  index,
   isThumbnail = false 
 }) {
-  // 1. Resolve effective ID and Cache Key synchronously
-  const attachmentId = useMemo(() => getEffectiveAttachmentId(attachment, attachment.index), [attachment]);
-  const cacheKey = useMemo(() => getBlobCacheKey(noteId, attachment, attachment.index), [noteId, attachment]);
+  // 1. Resolve effective ID and Cache Key 
+  const attachmentId = useMemo(() => getEffectiveAttachmentId(attachment, index ?? attachment.index), [attachment, index]);
+  
+  // 🟢 CRITICAL: ID Transition Support
+  // If we are currently sending, the cache might be under a temp index or the new server index.
+  // We check BOTH to prevent the "stuck on loading" glitch.
+  const cacheKey = useMemo(() => getBlobCacheKey(noteId, attachment, index ?? attachment.index), [noteId, attachment, index]);
 
-  // 2. Synchronous Cache Check (Fixes Flickering)
-  // If the hydration happened in the background (Lifecycle), we skip the loading state entirely.
-  const cachedData = blobCache.get(cacheKey);
-  const initialUrl = typeof cachedData === 'string' ? cachedData : cachedData?.url;
+  // 2. Synchronous Cache Check (Fixes Flickering & Transition Gaps)
+  const getInitialUrl = () => {
+    const direct = blobCache.get(cacheKey);
+    if (direct) return typeof direct === 'string' ? direct : direct.url;
+    
+    // Fallback: If this is an optimistic send, it might be in the cache with a different key format
+    // or we might have a stable blob URL in the attachment itself
+    if (attachment.url?.startsWith('blob:')) return attachment.url;
+    return null;
+  };
+
+  const initialUrl = getInitialUrl();
 
   const [objectUrl, setObjectUrl] = useState(initialUrl);
   const [status, setStatus] = useState(initialUrl ? 'success' : 'loading');
